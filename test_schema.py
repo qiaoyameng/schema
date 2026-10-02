@@ -11,9 +11,9 @@ from functools import partial
 from operator import methodcaller
 
 try:
-    from unittest.mock import Mock
+    from unittest.mock import Mock, call
 except ImportError:
-    from mock import Mock
+    from mock import Mock, call
 from pytest import mark, raises
 
 from schema import (
@@ -24,6 +24,7 @@ from schema import (
     Literal,
     Optional,
     Or,
+    Permutation,
     Regex,
     Schema,
     SchemaError,
@@ -31,6 +32,7 @@ from schema import (
     SchemaMissingKeyError,
     SchemaUnexpectedTypeError,
     SchemaWrongKeyError,
+    UnorderedSequence,
     Use,
 )
 
@@ -149,6 +151,119 @@ def test_or_only_one():
     assert extra_keys_schema.validate({"test2": "other_value"})
     with SE:
         extra_keys_schema.validate({"test1": "value", "test2": "other_value"})
+
+
+def test_permutation_does_not_let_broad_rule_take_unique_even():
+    is_even = lambda value: value % 2 == 0
+
+    assert Permutation(int, is_even).validate([2, 3]) == [3, 2]
+    assert Permutation(int, is_even).validate([3, 2]) == [3, 2]
+
+
+def test_permutation_treats_duplicate_values_by_position():
+    class EqualValue:
+        def __eq__(self, other):
+            return isinstance(other, EqualValue)
+
+    values = [EqualValue(), EqualValue()]
+
+    def first(rule_value):
+        if rule_value is not values[1]:
+            raise ValueError()
+        return "first"
+
+    def second(rule_value):
+        if rule_value is not values[0]:
+            raise ValueError()
+        return "second"
+
+    assert Permutation(Use(first), Use(second)).validate(values) == ["first", "second"]
+
+
+def test_permutation_uses_deterministic_assignment():
+    first = Mock(side_effect=lambda value: "first:%d" % value)
+    second = Mock(side_effect=lambda value: "second:%d" % value)
+
+    assert Permutation(Use(first), Use(second)).validate([0, 1]) == [
+        "first:0",
+        "second:1",
+    ]
+    first.assert_has_calls(
+        [call(0), call(1)],
+        any_order=True,
+    )
+    second.assert_has_calls(
+        [call(0), call(1)],
+        any_order=True,
+    )
+
+
+def test_permutation_continues_after_an_unrelated_conversion_failure():
+    def only_two(value):
+        if value != 2:
+            raise ValueError("nope")
+        return "two"
+
+    first = Mock(side_effect=lambda value: "first:%d" % value)
+
+    assert Permutation(Use(first), Use(only_two)).validate([2, 3]) == [
+        "first:3",
+        "two",
+    ]
+
+
+def test_permutation_reports_count_and_matching_conflicts():
+    with raises(SchemaError) as exc_info:
+        Permutation(int, lambda value: value % 2 == 0).validate([2])
+    assert "Expected exactly 2 values for 2 unordered rules, got 1" in str(exc_info.value)
+
+    with raises(SchemaError) as exc_info:
+        Permutation(int, lambda value: value % 2 == 0).validate([1, 3])
+    message = str(exc_info.value)
+    assert "No complete one-to-one assignment exists" in message
+    assert "rule 2" in message
+    assert "position" in message
+
+
+def test_permutation_rejects_non_sequence_and_reports_transformation_error():
+    with raises(SchemaError) as exc_info:
+        Permutation(int).validate("1")
+    assert "should be a non-character sequence" in str(exc_info.value)
+
+    def fail(value):
+        raise ValueError("boom")
+
+    with raises(SchemaError) as exc_info:
+        Permutation(Use(fail)).validate([1])
+    message = str(exc_info.value)
+    assert "No complete one-to-one assignment exists" in message
+    assert "fail(1) raised ValueError('boom')" in message
+
+
+def test_permutation_tuple_and_alias():
+    validator = UnorderedSequence(int, lambda value: value % 2 == 0)
+
+    assert validator.validate((2, 3)) == (3, 2)
+    assert isinstance(validator, Permutation)
+
+
+def test_permutation_limits_candidate_scale():
+    validator = Permutation(*[lambda value: True] * 101, max_size=100)
+
+    with raises(SchemaError) as exc_info:
+        validator.validate([0] * 101)
+    assert "limited to 100 positions and rules" in str(exc_info.value)
+
+
+def test_permutation_json_schema():
+    assert Schema(Permutation(int, str)).json_schema("my-id") == {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "items": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+        "$id": "my-id",
+        "$schema": "http://json-schema.org/draft-07/schema#",
+    }
 
 
 def test_test():

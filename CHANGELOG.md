@@ -4,6 +4,11 @@
 ## Unreleased
 
 
+### Features
+
+* Add `Permutation` / `UnorderedSequence` for complete one-to-one validation of values in any order.
+
+
 ## v0.7.8 (2025-10-11)
 
 ### Features
@@ -160,5 +165,4 @@
 ### Features
 
 * Add the "Regex" class. [Stavros Korokithakis]
-
 

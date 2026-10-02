@@ -20,7 +20,7 @@ entries with personal information:
 
 .. code:: python
     
-    from schema import Schema, And, Use, Optional, SchemaError
+    from schema import Schema, And, Permutation, Use, Optional, SchemaError
     
     schema = Schema(
         [
@@ -215,6 +215,32 @@ against all schemas listed inside that container and aggregate all errors:
     schema.SchemaError: Or(<class 'int'>, <class 'float'>) did not validate 'not int or float here'
     'not int or float here' should be instance of 'int'
     'not int or float here' should be instance of 'float'
+
+Unordered one-to-one sequences
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use ``Permutation`` when every declared rule must consume exactly one value,
+but the values may arrive in any order. It computes a complete one-to-one
+matching instead of matching each rule greedily. For example, the broader
+integer rule cannot take the only even value:
+
+.. code:: python
+
+    >>> even = lambda value: value % 2 == 0
+    >>> Permutation(int, even).validate([2, 3])
+    [3, 2]
+
+The returned values are ordered by the declared rules, regardless of input
+order. Duplicate values remain distinct input positions. If several complete
+assignments exist, the selected input positions are lexicographically smallest
+when viewed in declared-rule order.
+
+The validator must try candidates before it knows the final assignment.
+Therefore rule validators and conversions should be declared with no external
+side effects; ``Permutation`` does not roll back changes made by arbitrary
+user code. Each rule/value pair is probed at most once. Very large handshake
+sequences are rejected with ``max_size`` (default 100) to limit the number of
+candidates.
 
 Dictionaries
 ~~~~~~~~~~~~

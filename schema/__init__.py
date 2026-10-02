@@ -2,6 +2,11 @@
 obtained from config-files, forms, external services or command-line
 parsing, converted from JSON/YAML (or something else) to Python data-types."""
 
+try:
+    from collections.abc import Sequence as CollectionSequence
+except ImportError:
+    from collections import Sequence as CollectionSequence
+
 import inspect
 import re
 from typing import (
@@ -39,6 +44,8 @@ __all__ = [
     "Schema",
     "And",
     "Or",
+    "Permutation",
+    "UnorderedSequence",
     "Regex",
     "Optional",
     "Use",
@@ -221,6 +228,258 @@ class Or(And[TSchema]):
             ["%r did not validate %r" % (self, data)] + autos,
             [self._error.format(data) if self._error else None] + errors,
         )
+
+
+class Permutation(And[TSchema]):
+    """Validate one input value with each sub-schema, in any input order.
+
+    This is a complete one-to-one matching problem rather than positional
+    validation. When more than one complete assignment exists, the assignment
+    with the lexicographically smallest sequence of input positions (ordered by
+    declared rule order) is selected.
+
+    Sub-schemas should have no external side effects. Every rule/value pair is
+    probed at most once, but this validator does not attempt to roll back side
+    effects from user code.
+    """
+
+    DEFAULT_MAX_SIZE = 100
+
+    def __init__(
+        self, *args: Any, max_size: int = DEFAULT_MAX_SIZE, **kwargs: Any
+    ) -> None:
+        if not isinstance(max_size, int) or isinstance(max_size, bool) or max_size < 0:
+            raise ValueError("max_size must be a non-negative integer")
+        self.max_size = max_size
+        super(Permutation, self).__init__(*args, **kwargs)
+
+    @staticmethod
+    def _find_feasibility(
+        matches: List[List[int]],
+    ) -> Tuple[Union[List[int], None], Set[int], Set[int]]:
+        size = len(matches)
+        owner = [-1] * size
+
+        def augment(
+            rule: int, reachable_rules: Set[int], reachable_values: Set[int]
+        ) -> bool:
+            reachable_rules.add(rule)
+            for value in matches[rule]:
+                if value in reachable_values:
+                    continue
+                reachable_values.add(value)
+                current_rule = owner[value]
+                if current_rule == -1 or augment(
+                    current_rule, reachable_rules, reachable_values
+                ):
+                    owner[value] = rule
+                    return True
+            return False
+
+        for rule in range(size):
+            reachable_rules: Set[int] = set()
+            reachable_values: Set[int] = set()
+            if not augment(rule, reachable_rules, reachable_values):
+                return None, reachable_rules, reachable_values
+
+        assignment = [-1] * size
+        for value, rule in enumerate(owner):
+            assignment[rule] = value
+        return assignment, set(), set()
+
+    @staticmethod
+    def _smallest_assignment(matches: List[List[int]]) -> List[int]:
+        size = len(matches)
+        base = size + 1
+        weights = [base ** (size - rule - 1) for rule in range(size)]
+        infinity = size * size * base ** size + 1
+
+        u = [0] * (size + 1)
+        v = [0] * (size + 1)
+        p = [0] * (size + 1)
+        way = [0] * (size + 1)
+
+        for row in range(1, size + 1):
+            p[0] = row
+            column = 0
+            minimums = [infinity] * (size + 1)
+            used = [False] * (size + 1)
+
+            while True:
+                used[column] = True
+                rule = p[column]
+                delta = infinity
+                next_column = -1
+
+                for candidate_column in range(1, size + 1):
+                    if used[candidate_column]:
+                        continue
+
+                    input_position = candidate_column - 1
+                    if input_position in matches[rule - 1]:
+                        cost = weights[rule - 1] * input_position
+                    else:
+                        cost = infinity
+                    reduced_cost = cost - u[rule] - v[candidate_column]
+
+                    if reduced_cost < minimums[candidate_column]:
+                        minimums[candidate_column] = reduced_cost
+                        way[candidate_column] = column
+                    if minimums[candidate_column] < delta:
+                        delta = minimums[candidate_column]
+                        next_column = candidate_column
+
+                for candidate_column in range(size + 1):
+                    if used[candidate_column]:
+                        u[p[candidate_column]] += delta
+                        v[candidate_column] -= delta
+                    else:
+                        minimums[candidate_column] -= delta
+
+                column = next_column
+                if p[column] == 0:
+                    break
+
+            while True:
+                previous_column = way[column]
+                p[column] = p[previous_column]
+                column = previous_column
+                if column == 0:
+                    break
+
+        assignment = [-1] * size
+        for column in range(1, size + 1):
+            assignment[p[column] - 1] = column - 1
+        return assignment
+
+    def _matching_error(
+        self,
+        data: Sequence[Any],
+        matches: List[List[int]],
+        witness_rules: Set[int],
+        witness_values: Set[int],
+        rejections: List[List[SchemaError]],
+    ) -> SchemaError:
+        messages = ["No complete one-to-one assignment exists for %r" % data]
+
+        if witness_rules:
+            rule_number = ", ".join(str(rule + 1) for rule in sorted(witness_rules))
+            rules = (
+                "rule %s" % rule_number
+                if len(witness_rules) == 1
+                else "rules %s" % rule_number
+            )
+            require = (
+                "requires"
+                if len(witness_rules) == 1
+                else "require"
+            )
+            if witness_values:
+                availability = (
+                    "only %d distinct position%s can be matched: %s"
+                    % (
+                        len(witness_values),
+                        "" if len(witness_values) == 1 else "s",
+                        ", ".join(
+                            "position %d (%r)" % (value + 1, data[value])
+                            for value in sorted(witness_values)
+                        ),
+                    )
+                )
+            else:
+                availability = "no positions can be matched"
+            messages.append(
+                "%s %s %d distinct position%s, but %s"
+                % (
+                    rules,
+                    require,
+                    len(witness_rules),
+                    "" if len(witness_rules) == 1 else "s",
+                    availability,
+                )
+            )
+
+        for rule in sorted(witness_rules):
+            positions = ", ".join(
+                "position %d" % (value + 1) for value in matches[rule]
+            ) or "no positions"
+            messages.append(
+                "Rule %d (%r) matches %s" % (rule + 1, self._args[rule], positions)
+            )
+            for error in rejections[rule]:
+                messages.extend("    " + message for message in error.code.splitlines())
+
+        return SchemaError(
+            messages,
+            self._error.format(data) if self._error else None,
+        )
+
+    def validate(self, data: Any, **kwargs: Any) -> Any:
+        error_value = self._error.format(data) if self._error else None
+
+        if not isinstance(data, CollectionSequence) or isinstance(
+            data, (str, bytes, bytearray, memoryview)
+        ):
+            raise SchemaError(
+                "%r should be a non-character sequence such as a list or tuple"
+                % data,
+                error_value,
+            )
+
+        rule_count = len(self._args)
+        data_count = len(data)
+        if data_count != rule_count:
+            raise SchemaError(
+                "Expected exactly %d value%s for %d unordered rule%s, got %d"
+                % (
+                    rule_count,
+                    "" if rule_count == 1 else "s",
+                    rule_count,
+                    "" if rule_count == 1 else "s",
+                    data_count,
+                ),
+                error_value,
+            )
+
+        if rule_count > self.max_size:
+            raise SchemaError(
+                "Unordered sequence is limited to %d positions and rules, got %d"
+                % (self.max_size, rule_count),
+                error_value,
+            )
+
+        if rule_count == 0:
+            return type(data)() if isinstance(data, (list, tuple)) else []
+
+        matches: List[List[int]] = [[] for _ in range(rule_count)]
+        candidates: List[Dict[int, Any]] = [dict() for _ in range(rule_count)]
+        rejections: List[List[SchemaError]] = [[] for _ in range(rule_count)]
+
+        for rule_index, sub_schema in enumerate(self._build_schemas()):
+            for value_index, value in enumerate(data):
+                try:
+                    validated = sub_schema.validate(value, **kwargs)
+                except SchemaError as error:
+                    if len(rejections[rule_index]) < 10:
+                        rejections[rule_index].append(error)
+                else:
+                    matches[rule_index].append(value_index)
+                    candidates[rule_index][value_index] = validated
+
+        _, witness_rules, witness_values = self._find_feasibility(matches)
+        if witness_rules:
+            raise self._matching_error(
+                data, matches, witness_rules, witness_values, rejections
+            )
+
+        assignment = self._smallest_assignment(matches)
+        validated = [
+            candidates[rule_index][assignment[rule_index]]
+            for rule_index in range(rule_count)
+        ]
+        if isinstance(data, tuple):
+            return tuple(validated)
+        return validated
 
 
 class Regex:
@@ -716,6 +975,19 @@ class Schema(object):
                         return_schema["items"] = _json_schema(
                             Schema(Or(*s)), is_main_schema=False
                         )
+                elif isinstance(s, Permutation):
+                    return_schema["type"] = "array"
+                    return_schema["minItems"] = len(s.args)
+                    return_schema["maxItems"] = len(s.args)
+                    any_of_values = []
+                    for permutation_key in s.args:
+                        new_value = _json_schema(
+                            _to_schema(permutation_key, i), is_main_schema=False
+                        )
+                        if new_value != {} and new_value not in any_of_values:
+                            any_of_values.append(new_value)
+                    if any_of_values:
+                        return_schema["items"] = {"anyOf": any_of_values}
                 elif isinstance(s, Or):
                     # Handle Or values
 
@@ -976,6 +1248,9 @@ class Const(Schema):
     def validate(self, data: Any, **kwargs: Any) -> Any:
         super(Const, self).validate(data, **kwargs)
         return data
+
+
+UnorderedSequence = Permutation
 
 
 def _callable_str(callable_: Callable[..., Any]) -> str:
