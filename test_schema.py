@@ -29,8 +29,11 @@ from schema import (
     SchemaError,
     SchemaForbiddenKeyError,
     SchemaMissingKeyError,
+    SchemaSwitchKeyError,
+    SchemaSwitchSelectorError,
     SchemaUnexpectedTypeError,
     SchemaWrongKeyError,
+    Switch,
     Use,
 )
 
@@ -2100,3 +2103,102 @@ def test_tuple_key_error_message_does_not_crash():
     with raises(SchemaError) as exc_info:
         Schema({("a", "b"): int}).validate({("a", "b"): "not-an-int"})
     assert "Key '('a', 'b')' error:" in exc_info.value.code
+
+
+def test_switch_selects_value_schema_by_matched_key():
+    calls = []
+
+    def selector(key):
+        calls.append(key)
+        return key
+
+    switch = Switch(
+        selector,
+        {
+            "v1": Use(lambda v: ("old", v)),
+            "v2": Use(lambda v: ("new", v)),
+        },
+    )
+    schema = Schema({str: switch})
+
+    assert schema.validate({"v1": 1}) == {"v1": ("old", 1)}
+    assert schema.validate({"v2": 2}) == {"v2": ("new", 2)}
+    # Same schema, keys in reversed order: each key must get its own rule,
+    # the first selected rule must not be cached for all keys.
+    assert schema.validate({"v2": 2, "v1": 1}) == {
+        "v2": ("new", 2),
+        "v1": ("old", 1),
+    }
+    # Each mapping item is selected exactly once, no shared state between
+    # keys or between validate() calls.
+    assert calls == ["v1", "v2", "v2", "v1"]
+
+
+def test_switch_unknown_selection_is_not_a_value_error():
+    schema = Schema({str: Switch(lambda k: k, {"v1": int, "v2": str})})
+
+    with raises(SchemaSwitchKeyError) as exc_info:
+        schema.validate({"v3": 1})
+    assert "unknown selection 'v3'" in exc_info.value.code
+    assert "for key 'v3' (raw key 'v3')" in exc_info.value.code
+    # A selection failure is not reported as a "Key ... error:" value error.
+    assert "Key 'v3' error:" not in exc_info.value.code
+
+    # An invalid value under a known selection is a plain SchemaError and
+    # stays distinguishable from the selection errors above.
+    with raises(SchemaError) as exc_info:
+        schema.validate({"v1": "not-an-int"})
+    assert not isinstance(
+        exc_info.value, (SchemaSwitchKeyError, SchemaSwitchSelectorError)
+    )
+    assert "Key 'v1' error:" in exc_info.value.code
+
+
+def test_switch_selector_exception_is_not_a_value_error():
+    def boom(key):
+        raise ValueError("boom")
+
+    schema = Schema({str: Switch(boom, {"v1": int})})
+    with raises(SchemaSwitchSelectorError) as exc_info:
+        schema.validate({"v1": 1})
+    assert "boom" in exc_info.value.code
+    assert "ValueError" in exc_info.value.code
+
+
+def test_switch_selector_sees_transformed_key_and_keeps_raw_key():
+    seen = []
+
+    def selector(key):
+        seen.append(key)
+        return key
+
+    schema = Schema({Use(int): Switch(selector, {1: str})})
+    assert schema.validate({"1": "x"}) == {1: "x"}
+    # The selector sees the transformed key, not the raw data key.
+    assert seen == [1]
+
+    # Both the transformed and the raw key are kept for error reporting.
+    failing = Schema({Use(int): Switch(lambda k: k, {2: str})})
+    with raises(SchemaSwitchKeyError) as exc_info:
+        failing.validate({"1": "x"})
+    assert "for key 1 (raw key '1')" in exc_info.value.code
+
+
+def test_switch_nested_validation_keeps_path():
+    schema = Schema({"outer": {str: Switch(lambda k: k, {"v1": {"inner": int}})}})
+    with raises(SchemaError) as exc_info:
+        schema.validate({"outer": {"v1": {"inner": "not-an-int"}}})
+    assert "Key 'outer' error:" in exc_info.value.code
+    assert "Key 'v1' error:" in exc_info.value.code
+    assert "Key 'inner' error:" in exc_info.value.code
+
+
+def test_switch_requires_callable_selector():
+    with raises(TypeError):
+        Switch("v1", {"v1": int})
+
+
+def test_switch_standalone_is_rejected():
+    with raises(SchemaError) as exc_info:
+        Schema(Switch(lambda k: k, {"v1": int})).validate(1)
+    assert "can only be used as the value of a dict schema" in exc_info.value.code

@@ -51,6 +51,9 @@ __all__ = [
     "SchemaForbiddenKeyError",
     "SchemaUnexpectedTypeError",
     "SchemaOnlyOneAllowedError",
+    "SchemaSwitchKeyError",
+    "SchemaSwitchSelectorError",
+    "Switch",
 ]
 
 
@@ -116,6 +119,20 @@ class SchemaForbiddenKeyError(SchemaError):
 class SchemaUnexpectedTypeError(SchemaError):
     """Error should be raised when a type mismatch is detected within the
     data set being validated."""
+
+    pass
+
+
+class SchemaSwitchKeyError(SchemaError):
+    """Error should be raised when a Switch selector returns a selection
+    that is not present in the Switch mapping (e.g. an unknown version)."""
+
+    pass
+
+
+class SchemaSwitchSelectorError(SchemaError):
+    """Error should be raised when a Switch selector itself raises while
+    computing the selection for a matched key."""
 
     pass
 
@@ -328,6 +345,98 @@ class Use:
             )
 
 
+class Switch:
+    """
+    Selects the value schema of a dict mapping item based on the key that
+    actually matched, e.g. a version tag in a report where "v1" maps to an
+    old structure and "v2" to a new one.
+
+    The selector is a callable explicitly provided by the program; it is
+    never taken from the validated data. It is called exactly once per
+    matched mapping item with the *transformed* key (the result of
+    validating the raw data key against the key schema). Both the raw and
+    the transformed key are kept so selection errors can report them.
+
+    No state is shared between keys or validations: the selection is
+    computed fresh for every matched item and is never cached.
+    """
+
+    def __init__(
+        self,
+        selector: Callable[[Any], Any],
+        mapping: Dict[Any, Any],
+        error: Union[str, None] = None,
+    ) -> None:
+        if not callable(selector):
+            raise TypeError(f"Expected a callable selector, not {selector!r}")
+        self._selector: Callable[[Any], Any] = selector
+        self._mapping: Dict[Any, Any] = dict(mapping)
+        self._error: Union[str, None] = error
+
+    def __repr__(self) -> str:
+        return "%s(%r, %r)" % (
+            self.__class__.__name__,
+            self._selector,
+            self._mapping,
+        )
+
+    @property
+    def selector(self) -> Callable[[Any], Any]:
+        """The provided selector callable"""
+        return self._selector
+
+    @property
+    def mapping(self) -> Dict[Any, Any]:
+        """The provided mapping of selection to value schema"""
+        return self._mapping
+
+    def select(self, nkey: Any, raw_key: Any) -> Any:
+        """Return the value schema selected for a matched key.
+
+        :param nkey: the transformed key (after key-schema validation),
+            which is what the selector sees.
+        :param raw_key: the key as it appeared in the input data, kept for
+            error reporting.
+        """
+        try:
+            selection = self._selector(nkey)
+        except SchemaError:
+            raise
+        except BaseException as x:
+            message = "Switch selector %s raised %r for key %r (raw key %r)" % (
+                _callable_str(self._selector),
+                x,
+                nkey,
+                raw_key,
+            )
+            raise SchemaSwitchSelectorError(
+                message, self._error.format(nkey) if self._error else None
+            )
+        try:
+            return self._mapping[selection]
+        except (KeyError, TypeError):
+            message = (
+                "Switch selector %s returned unknown selection %r for key %r "
+                "(raw key %r); expected one of %s"
+                % (
+                    _callable_str(self._selector),
+                    selection,
+                    nkey,
+                    raw_key,
+                    ", ".join(repr(k) for k in sorted(self._mapping, key=repr)),
+                )
+            )
+            raise SchemaSwitchKeyError(
+                message, self._error.format(nkey) if self._error else None
+            )
+
+    def validate(self, data: Any, **kwargs: Any) -> Any:
+        raise SchemaError(
+            "%r can only be used as the value of a dict schema, where it "
+            "selects the value schema from the matched key" % (self,)
+        )
+
+
 COMPARABLE, CALLABLE, VALIDATOR, TYPE, DICT, ITERABLE = range(6)
 
 
@@ -495,6 +604,15 @@ class Schema(object):
                                     continue
                                 skey.handler(nkey, data, e)
                             else:
+                                if isinstance(svalue, Switch):
+                                    # Resolve the value schema from the matched
+                                    # key before validating the value. Selection
+                                    # errors (unknown selection, selector
+                                    # failure) carry their own key context and
+                                    # must stay distinguishable from value
+                                    # validation errors, so they are raised
+                                    # outside the "Key '%s' error:" wrapping.
+                                    svalue = svalue.select(nkey, key)
                                 try:
                                     nvalue = Schema(
                                         svalue, error=e, ignore_extra_keys=i
