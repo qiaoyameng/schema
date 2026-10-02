@@ -31,6 +31,7 @@ from schema import (
     SchemaMissingKeyError,
     SchemaUnexpectedTypeError,
     SchemaWrongKeyError,
+    Secret,
     Use,
 )
 
@@ -2100,3 +2101,175 @@ def test_tuple_key_error_message_does_not_crash():
     with raises(SchemaError) as exc_info:
         Schema({("a", "b"): int}).validate({("a", "b"): "not-an-int"})
     assert "Key '('a', 'b')' error:" in exc_info.value.code
+
+
+# A token mixing quotes, backslashes and regex/format special characters, so
+# that naive string replacement or regex escaping would fail to hide it.
+SECRET_TOKEN = "t0k3n!@#$%^&*()'\"\\[]{}<>|~"
+
+
+def _public_error_strings(error):
+    """Every stringification entry point of a SchemaError."""
+    strings = [str(error), error.code, repr(error)]
+    strings += [str(auto) for auto in error.autos]
+    strings += [str(err) for err in error.errors]
+    return strings
+
+
+def _assert_secret_hidden(error, token=SECRET_TOKEN):
+    for text in _public_error_strings(error):
+        assert token not in text
+
+
+def test_secret_returns_validated_value_on_success():
+    assert Schema(Secret(str)).validate(SECRET_TOKEN) == SECRET_TOKEN
+    assert Schema(Secret(Use(int))).validate("123") == 123
+    assert Schema({"token": Secret(str)}).validate({"token": SECRET_TOKEN}) == {
+        "token": SECRET_TOKEN
+    }
+
+
+def test_secret_inner_type_error_hides_value():
+    with raises(SchemaError) as exc_info:
+        Schema(Secret(str)).validate(SECRET_TOKEN.encode("utf-8"))
+    _assert_secret_hidden(exc_info.value, SECRET_TOKEN.encode("utf-8").decode("utf-8"))
+    assert str(exc_info.value) == "********** should be instance of 'str'"
+
+
+def test_secret_inner_callable_error_hides_value():
+    with raises(SchemaError) as exc_info:
+        Schema(Secret(And(str, lambda t: t.startswith("ok")))).validate(SECRET_TOKEN)
+    _assert_secret_hidden(exc_info.value)
+    assert "<lambda>(**********) should evaluate to True" in str(exc_info.value)
+
+
+def test_secret_dict_field_error_keeps_path_hides_value():
+    with raises(SchemaError) as exc_info:
+        Schema({"password": Secret(And(str, lambda t: len(t) > 100))}).validate(
+            {"password": SECRET_TOKEN}
+        )
+    _assert_secret_hidden(exc_info.value)
+    assert "Key 'password' error:" in str(exc_info.value)
+    assert "<lambda>(**********) should evaluate to True" in str(exc_info.value)
+
+
+def test_secret_nested_dict_error_keeps_path_hides_value():
+    with raises(SchemaError) as exc_info:
+        Schema(Secret({"credentials": {"token": int}})).validate(
+            {"credentials": {"token": SECRET_TOKEN}}
+        )
+    _assert_secret_hidden(exc_info.value)
+    assert "Key 'credentials' error:" in str(exc_info.value)
+    assert "Key 'token' error:" in str(exc_info.value)
+    assert "********** should be instance of 'int'" in str(exc_info.value)
+
+
+def test_secret_sequence_error_hides_value():
+    with raises(SchemaError) as exc_info:
+        Schema(Secret([int])).validate([SECRET_TOKEN])
+    _assert_secret_hidden(exc_info.value)
+    assert "did not validate **********" in str(exc_info.value)
+    assert "********** should be instance of 'int'" in str(exc_info.value)
+
+
+def test_secret_or_inside_hides_value():
+    with raises(SchemaError) as exc_info:
+        Schema(Secret(Or(int, float))).validate(SECRET_TOKEN)
+    _assert_secret_hidden(exc_info.value)
+    assert "did not validate **********" in str(exc_info.value)
+
+
+def test_secret_or_sibling_branch_does_not_leak():
+    # The Or re-wraps the failure of the Secret branch and must not re-insert
+    # the value, and the non-secret sibling branch must not leak it either.
+    with raises(SchemaError) as exc_info:
+        Schema(Or(Secret(And(str, lambda t: False)), int)).validate(SECRET_TOKEN)
+    _assert_secret_hidden(exc_info.value)
+    assert "did not validate **********" in str(exc_info.value)
+
+
+def test_secret_and_sibling_branch_does_not_leak():
+    with raises(SchemaError) as exc_info:
+        Schema(And(Secret(str), lambda t: len(t) > 100)).validate(SECRET_TOKEN)
+    _assert_secret_hidden(exc_info.value)
+    assert "<lambda>(**********) should evaluate to True" in str(exc_info.value)
+
+
+def test_secret_use_exception_text_is_degraded():
+    # int() raises a ValueError whose message embeds the token; the public
+    # error must degrade to the exception type name only.
+    with raises(SchemaError) as exc_info:
+        Schema(Secret(Use(int))).validate(SECRET_TOKEN)
+    _assert_secret_hidden(exc_info.value)
+    assert str(exc_info.value) == "int(**********) raised ValueError"
+
+
+def test_secret_user_schema_error_text_is_degraded():
+    def check(token):
+        raise SchemaError("token %s is not valid" % token)
+
+    with raises(SchemaError) as exc_info:
+        Schema(Secret(check)).validate(SECRET_TOKEN)
+    _assert_secret_hidden(exc_info.value)
+    assert "check(**********)" in str(exc_info.value)
+    assert "message hidden for sensitive input" in str(exc_info.value)
+
+
+def test_secret_user_validator_exception_text_is_degraded():
+    class TokenValidator:
+        def validate(self, data, **kwargs):
+            raise ValueError("bad token: %s" % data)
+
+    with raises(SchemaError) as exc_info:
+        Schema(Secret(TokenValidator())).validate(SECRET_TOKEN)
+    _assert_secret_hidden(exc_info.value)
+    assert "validate(**********) raised ValueError" in str(exc_info.value)
+
+
+def test_secret_regex_error_hides_value():
+    with raises(SchemaError) as exc_info:
+        Schema(Secret(Regex(r"^ok"))).validate(SECRET_TOKEN)
+    _assert_secret_hidden(exc_info.value)
+    assert str(exc_info.value) == "********** does not match '^ok'"
+
+
+def test_secret_custom_error_formats_placeholder():
+    with raises(SchemaError) as exc_info:
+        Schema(Secret(str, error="invalid token: {}")).validate(123)
+    _assert_secret_hidden(exc_info.value, "123")
+    assert exc_info.value.errors == [None, "invalid token: **********"]
+
+
+def test_secret_wrong_key_hides_mapping():
+    with raises(SchemaError) as exc_info:
+        Schema(Secret({"a": str})).validate({"a": "ok", "b": SECRET_TOKEN})
+    _assert_secret_hidden(exc_info.value)
+    assert "Wrong key 'b' in **********" in str(exc_info.value)
+
+
+def test_secret_wrong_key_next_to_secret_field_hides_mapping():
+    with raises(SchemaError) as exc_info:
+        Schema({"password": Secret(str)}).validate(
+            {"password": SECRET_TOKEN, "extra": 1}
+        )
+    _assert_secret_hidden(exc_info.value)
+    assert "Wrong key 'extra' in **********" in str(exc_info.value)
+
+
+def test_secret_marker_does_not_escape_scope():
+    # A failure validated after a Secret failure must format normally again.
+    with raises(SchemaError):
+        Schema(Secret(str)).validate(123)
+    with raises(SchemaError) as exc_info:
+        Schema(str).validate(123)
+    assert str(exc_info.value) == "123 should be instance of 'str'"
+
+
+def test_unmarked_rules_keep_value_in_error():
+    # Rules not wrapped in Secret keep reporting the input value.
+    with raises(SchemaError) as exc_info:
+        Schema(int).validate(SECRET_TOKEN)
+    assert repr(SECRET_TOKEN) in str(exc_info.value)
+    with raises(SchemaError) as exc_info:
+        Schema(And(str, lambda t: False)).validate(SECRET_TOKEN)
+    assert repr(SECRET_TOKEN) in str(exc_info.value)

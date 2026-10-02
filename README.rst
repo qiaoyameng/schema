@@ -502,6 +502,34 @@ You can exit with ``sys.exit(exc.code)`` if you want to show the messages
 to the user without traceback. ``error`` messages are given precedence in that
 case.
 
+Sensitive data with ``Secret``
+-------------------------------------------------------------------------------
+
+Error messages usually include a ``repr`` of the offending input, which is
+not something you want in logs when validating passwords or tokens. Wrap the
+rule in ``Secret`` to replace the sensitive input with a fixed placeholder
+(``**********``) in every public error string, while keeping the field path
+and the failing rule visible:
+
+.. code:: python
+
+    >>> from schema import Schema, And, Secret
+
+    >>> Schema({"password": Secret(And(str, lambda s: len(s) > 6))}).validate(
+    ...     {"password": "hai"})
+    Traceback (most recent call last):
+    ...
+    schema.SchemaError: Key 'password' error:
+    <lambda>(**********) should evaluate to True
+
+The marker propagates through nested mappings, sequences, ``And``/``Or`` and
+``Use``, and outer layers re-wrapping the error do not re-insert the original
+value. If a user validator raises an exception whose text may embed the
+input, the text is dropped and only the exception type is reported, e.g.
+``int(**********) raised ValueError``. Successful validation returns the
+validated value unchanged, and rules not wrapped in ``Secret`` keep their
+usual error format.
+
 A JSON API example
 -------------------------------------------------------------------------------
 

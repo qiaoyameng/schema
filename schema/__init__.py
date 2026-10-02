@@ -4,6 +4,7 @@ parsing, converted from JSON/YAML (or something else) to Python data-types."""
 
 import inspect
 import re
+import threading
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -42,6 +43,7 @@ __all__ = [
     "Regex",
     "Optional",
     "Use",
+    "Secret",
     "Forbidden",
     "Const",
     "Literal",
@@ -64,6 +66,9 @@ class SchemaError(Exception):
     ):
         self.autos = autos if isinstance(autos, List) else [autos]
         self.errors = errors if isinstance(errors, List) else [errors]
+        # True when this error is known to be free of sensitive input, either
+        # because it was built with redacted values or degraded on purpose.
+        self._secret = False
         Exception.__init__(self, self.code)
 
     @property
@@ -120,6 +125,70 @@ class SchemaUnexpectedTypeError(SchemaError):
     pass
 
 
+# Placeholder shown in error messages instead of sensitive input.
+_SECRET_PLACEHOLDER = "**********"
+
+# Safe degradation used when a user validator raises its own error inside a
+# Secret scope: the custom text is dropped since it may embed sensitive input.
+_SECRET_ERROR_HIDDEN = "raised an error (message hidden for sensitive input)"
+
+# Thread-local flag telling whether validation currently runs inside a
+# Secret scope, i.e. whether the data being validated is sensitive.
+_secret_state = threading.local()
+
+
+def _secret_active() -> bool:
+    """Return whether validation is currently running inside a Secret scope."""
+    return getattr(_secret_state, "active", False)
+
+
+class _Redacted:
+    """Stand-in for sensitive data, stringifies to a fixed placeholder."""
+
+    def __repr__(self) -> str:
+        return _SECRET_PLACEHOLDER
+
+    def __str__(self) -> str:
+        return _SECRET_PLACEHOLDER
+
+
+_REDACTED = _Redacted()
+
+
+def _safe_data(data: Any, secret: bool) -> Any:
+    """Return a placeholder for sensitive data, the data itself otherwise."""
+    return _REDACTED if secret else data
+
+
+def _mark_secret(error: SchemaError, secret: bool) -> SchemaError:
+    """Flag an error as sanitized, so outer layers re-wrapping it keep
+    sensitive data out of the messages they build on top of it."""
+    if secret:
+        error._secret = True
+    return error
+
+
+def _contains_secret(s: Any) -> bool:
+    """Return whether a schema (sub)tree wraps a Secret, meaning the data it
+    validates must be treated as sensitive even by sibling rules."""
+    if isinstance(s, Secret):
+        return True
+    if isinstance(s, And):
+        return any(_contains_secret(a) for a in s.args)
+    if isinstance(s, Schema):
+        return _contains_secret(s._schema)
+    if isinstance(s, Literal):
+        return _contains_secret(s._schema)
+    if type(s) in (list, tuple, set, frozenset):
+        return any(_contains_secret(x) for x in s)
+    if isinstance(s, dict):
+        return any(
+            _contains_secret(key) or _contains_secret(value)
+            for key, value in s.items()
+        )
+    return False
+
+
 # Type variable to represent a Schema-like type
 TSchema = TypeVar("TSchema", bound="Schema")
 
@@ -140,6 +209,7 @@ class And(Generic[TSchema]):
         self._error: Union[str, None] = error
         self._ignore_extra_keys: bool = ignore_extra_keys
         self._schema_class: Type[TSchema] = schema if schema is not None else Schema
+        self._has_secret: bool = any(_contains_secret(a) for a in args)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({', '.join(repr(a) for a in self._args)})"
@@ -156,10 +226,18 @@ class And(Generic[TSchema]):
         :param data: Data to be validated with sub defined schemas.
         :return: Returns validated data.
         """
-        # Annotate sub_schema with the type returned by _build_schema
-        for sub_schema in self._build_schemas():  # type: TSchema
-            data = sub_schema.validate(data, **kwargs)
-        return data
+        previous = getattr(_secret_state, "active", False)
+        if self._has_secret:
+            # A sibling rule is a Secret: the data is sensitive for every
+            # sub schema, not only for the wrapped one.
+            _secret_state.active = True
+        try:
+            # Annotate sub_schema with the type returned by _build_schema
+            for sub_schema in self._build_schemas():  # type: TSchema
+                data = sub_schema.validate(data, **kwargs)
+            return data
+        finally:
+            _secret_state.active = previous
 
     def _build_schemas(self) -> List[TSchema]:
         return [self._build_schema(s) for s in self._args]
@@ -207,20 +285,39 @@ class Or(And[TSchema]):
         """
         autos: List[str] = []
         errors: List[Union[str, None]] = []
-        for sub_schema in self._build_schemas():
-            try:
-                validation: Any = sub_schema.validate(data, **kwargs)
-                self.match_count += 1
-                if self.match_count > 1 and self.only_one:
-                    break
-                return validation
-            except SchemaError as _x:
-                autos += _x.autos
-                errors += _x.errors
-        raise SchemaError(
-            ["%r did not validate %r" % (self, data)] + autos,
-            [self._error.format(data) if self._error else None] + errors,
-        )
+        previous = getattr(_secret_state, "active", False)
+        if self._has_secret:
+            # A sibling rule is a Secret: the data is sensitive for every
+            # sub schema, not only for the wrapped one.
+            _secret_state.active = True
+        try:
+            secret: bool = _secret_active()
+            for sub_schema in self._build_schemas():
+                try:
+                    validation: Any = sub_schema.validate(data, **kwargs)
+                    self.match_count += 1
+                    if self.match_count > 1 and self.only_one:
+                        break
+                    return validation
+                except SchemaError as _x:
+                    secret = secret or getattr(_x, "_secret", False)
+                    autos += _x.autos
+                    errors += _x.errors
+            raise _mark_secret(
+                SchemaError(
+                    ["%r did not validate %r" % (self, _safe_data(data, secret))]
+                    + autos,
+                    [
+                        self._error.format(_safe_data(data, secret))
+                        if self._error
+                        else None
+                    ]
+                    + errors,
+                ),
+                secret,
+            )
+        finally:
+            _secret_state.active = previous
 
 
 class Regex:
@@ -268,22 +365,26 @@ class Regex:
         :return: Returns validated data.
         """
         e = self._error
+        secret = _secret_active()
+        safe_data = _safe_data(data, secret)
 
         try:
             if self._pattern.search(data):
                 return data
             else:
                 error_message = (
-                    e.format(data)
+                    e.format(safe_data)
                     if e
-                    else f"{data!r} does not match {self._pattern_str!r}"
+                    else "%r does not match %r" % (safe_data, self._pattern_str)
                 )
-                raise SchemaError(error_message)
+                raise _mark_secret(SchemaError(error_message), secret)
         except TypeError:
             error_message = (
-                e.format(data) if e else f"{data!r} is not string nor buffer"
+                e.format(safe_data)
+                if e
+                else "%r is not string nor buffer" % (safe_data,)
             )
-            raise SchemaError(error_message)
+            raise _mark_secret(SchemaError(error_message), secret)
 
 
 class Use:
@@ -316,16 +417,94 @@ class Use:
         try:
             return self._callable(data)
         except SchemaError as x:
-            raise SchemaError(
-                [None] + x.autos,
-                [self._error.format(data) if self._error else None] + x.errors,
+            secret = _secret_active()
+            if secret and not getattr(x, "_secret", False):
+                # The callable raised its own SchemaError whose text may embed
+                # the sensitive input: degrade to a fixed safe message instead
+                # of trying to guess and blank out the secret.
+                f = _callable_str(self._callable)
+                message = "%s(%r) %s" % (f, _REDACTED, _SECRET_ERROR_HIDDEN)
+                raise _mark_secret(
+                    SchemaError(
+                        [None, message],
+                        [self._error.format(_REDACTED) if self._error else None]
+                        + [message],
+                    ),
+                    True,
+                )
+            secret = secret or getattr(x, "_secret", False)
+            raise _mark_secret(
+                SchemaError(
+                    [None] + x.autos,
+                    [
+                        self._error.format(_safe_data(data, secret))
+                        if self._error
+                        else None
+                    ]
+                    + x.errors,
+                ),
+                secret,
             )
         except BaseException as x:
             f = _callable_str(self._callable)
+            if _secret_active():
+                # The raised exception may embed the sensitive input in its
+                # text: degrade to the exception type name only.
+                raise _mark_secret(
+                    SchemaError(
+                        "%s(%r) raised %s" % (f, _REDACTED, type(x).__name__),
+                        self._error.format(_REDACTED) if self._error else None,
+                    ),
+                    True,
+                )
             raise SchemaError(
                 "%s(%r) raised %r" % (f, data, x),
                 self._error.format(data) if self._error else None,
             )
+
+
+class Secret:
+    """
+    Wrapper marking the validated data as sensitive (passwords, tokens, ...).
+
+    Error messages produced while validating the wrapped schema replace the
+    sensitive input with a fixed placeholder, so they stay safe to log. The
+    marker propagates through nested mappings, sequences, And/Or and Use, and
+    outer layers re-wrapping the error do not re-insert the original value.
+    Field paths and rule names are preserved, and successful validation
+    returns the validated value unchanged.
+    """
+
+    def __init__(self, schema: Any, error: Union[str, None] = None) -> None:
+        self._schema: Any = schema
+        self._error: Union[str, None] = error
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self._schema!r})"
+
+    @property
+    def schema(self) -> Any:
+        """The wrapped schema"""
+        return self._schema
+
+    def validate(self, data: Any, **kwargs: Any) -> Any:
+        """
+        Validate data against the wrapped schema, keeping the sensitive input
+        out of any raised SchemaError.
+        :param data: Data to be validated.
+        :return: Returns validated data.
+        """
+        previous = getattr(_secret_state, "active", False)
+        _secret_state.active = True
+        try:
+            return Schema(self._schema, error=self._error).validate(data, **kwargs)
+        except SchemaError as x:
+            # Anything escaping the scope is considered sanitized: outer
+            # layers must not re-insert the sensitive value when re-wrapping.
+            x._secret = True
+            raise
+        finally:
+            _secret_state.active = previous
 
 
 COMPARABLE, CALLABLE, VALIDATOR, TYPE, DICT, ITERABLE = range(6)
@@ -439,6 +618,7 @@ class Schema(object):
         s: Any = self._schema
         e: Union[str, None] = self._error
         i: bool = self._ignore_extra_keys
+        secret: bool = _secret_active()
 
         if isinstance(s, Literal):
             s = s.schema
@@ -450,6 +630,10 @@ class Schema(object):
             return type(data)(o.validate(d, **kwargs) for d in data)
         if flavor == DICT:
             exitstack = ExitStack()
+            if not secret:
+                # A mapping holding a Secret anywhere treats whole-mapping
+                # dumps (wrong key reports, custom errors) as sensitive too.
+                secret = _contains_secret(s)
             data = Schema(dict, error=e).validate(data, **kwargs)
             new: Dict = type(data)()  # new - is a dict of the validated values
             coverage: Set = set()  # matched schema keys
@@ -502,9 +686,18 @@ class Schema(object):
                                 except SchemaError as x:
                                     k = "Key '%s' error:" % (nkey,)
                                     message = self._prepend_schema_name(k)
-                                    raise SchemaError(
-                                        [message] + x.autos,
-                                        [e.format(data) if e else None] + x.errors,
+                                    err_secret = secret or getattr(x, "_secret", False)
+                                    raise _mark_secret(
+                                        SchemaError(
+                                            [message] + x.autos,
+                                            [
+                                                e.format(_safe_data(data, err_secret))
+                                                if e
+                                                else None
+                                            ]
+                                            + x.errors,
+                                        ),
+                                        err_secret,
                                     )
                                 else:
                                     new[nkey] = nvalue
@@ -521,14 +714,19 @@ class Schema(object):
                     s_missing_keys,
                 )
                 message = self._prepend_schema_name(message)
-                raise SchemaMissingKeyError(message, e.format(data) if e else None)
+                raise _mark_secret(
+                    SchemaMissingKeyError(
+                        message, e.format(_safe_data(data, secret)) if e else None
+                    ),
+                    secret,
+                )
             if not self._ignore_extra_keys and (len(new) != len(data)):
                 wrong_keys = set(data.keys()) - set(new.keys())
                 s_wrong_keys = ", ".join(repr(k) for k in sorted(wrong_keys, key=repr))
                 message = "Wrong key%s %s in %r" % (
                     _plural_s(wrong_keys),
                     s_wrong_keys,
-                    data,
+                    _safe_data(data, secret),
                 )
                 message = self._prepend_schema_name(message)
                 # Surface any custom error from the key schema(s) that rejected
@@ -539,11 +737,11 @@ class Schema(object):
                     if k in key_errors
                 ]
                 errors: Union[List, str, None] = (
-                    [e.format(data) if e else None] + custom_errors
+                    [e.format(_safe_data(data, secret)) if e else None] + custom_errors
                     if custom_errors
-                    else (e.format(data) if e else None)
+                    else (e.format(_safe_data(data, secret)) if e else None)
                 )
-                raise SchemaWrongKeyError(message, errors)
+                raise _mark_secret(SchemaWrongKeyError(message, errors), secret)
 
             # Apply default-having optionals that haven't been used:
             defaults = (
@@ -562,42 +760,128 @@ class Schema(object):
             if isinstance(data, s) and not (isinstance(data, bool) and s == int):
                 return data
             else:
-                message = "%r should be instance of %r" % (data, s.__name__)
+                message = "%r should be instance of %r" % (
+                    _safe_data(data, secret),
+                    s.__name__,
+                )
                 message = self._prepend_schema_name(message)
-                raise SchemaUnexpectedTypeError(message, e.format(data) if e else None)
+                raise _mark_secret(
+                    SchemaUnexpectedTypeError(
+                        message, e.format(_safe_data(data, secret)) if e else None
+                    ),
+                    secret,
+                )
         if flavor == VALIDATOR:
             try:
                 return s.validate(data, **kwargs)
             except SchemaError as x:
-                raise SchemaError(
-                    [None] + x.autos, [e.format(data) if e else None] + x.errors
+                if secret and not getattr(x, "_secret", False):
+                    # The validator raised its own SchemaError whose text may
+                    # embed the sensitive input: degrade to a fixed safe
+                    # message instead of trying to guess and blank out the
+                    # secret.
+                    message = "%r.validate(%r) %s" % (
+                        s,
+                        _REDACTED,
+                        _SECRET_ERROR_HIDDEN,
+                    )
+                    message = self._prepend_schema_name(message)
+                    raise _mark_secret(
+                        SchemaError(
+                            [None, message],
+                            [e.format(_REDACTED) if e else None, message],
+                        ),
+                        True,
+                    )
+                err_secret = secret or getattr(x, "_secret", False)
+                raise _mark_secret(
+                    SchemaError(
+                        [None] + x.autos,
+                        [e.format(_safe_data(data, err_secret)) if e else None]
+                        + x.errors,
+                    ),
+                    err_secret,
                 )
             except BaseException as x:
-                message = "%r.validate(%r) raised %r" % (s, data, x)
+                if secret:
+                    # The raised exception may embed the sensitive input in
+                    # its text: degrade to the exception type name only.
+                    message = "%r.validate(%r) raised %s" % (
+                        s,
+                        _REDACTED,
+                        type(x).__name__,
+                    )
+                else:
+                    message = "%r.validate(%r) raised %r" % (s, data, x)
                 message = self._prepend_schema_name(message)
-                raise SchemaError(message, e.format(data) if e else None)
+                raise _mark_secret(
+                    SchemaError(
+                        message, e.format(_safe_data(data, secret)) if e else None
+                    ),
+                    secret,
+                )
         if flavor == CALLABLE:
             f = _callable_str(s)
             try:
                 if s(data):
                     return data
             except SchemaError as x:
-                raise SchemaError(
-                    [None] + x.autos, [e.format(data) if e else None] + x.errors
+                if secret and not getattr(x, "_secret", False):
+                    # The callable raised its own SchemaError whose text may
+                    # embed the sensitive input: degrade to a fixed safe
+                    # message instead of trying to guess and blank out the
+                    # secret.
+                    message = "%s(%r) %s" % (f, _REDACTED, _SECRET_ERROR_HIDDEN)
+                    message = self._prepend_schema_name(message)
+                    raise _mark_secret(
+                        SchemaError(
+                            [None, message],
+                            [e.format(_REDACTED) if e else None, message],
+                        ),
+                        True,
+                    )
+                err_secret = secret or getattr(x, "_secret", False)
+                raise _mark_secret(
+                    SchemaError(
+                        [None] + x.autos,
+                        [e.format(_safe_data(data, err_secret)) if e else None]
+                        + x.errors,
+                    ),
+                    err_secret,
                 )
             except BaseException as x:
-                message = "%s(%r) raised %r" % (f, data, x)
+                if secret:
+                    # The raised exception may embed the sensitive input in
+                    # its text: degrade to the exception type name only.
+                    message = "%s(%r) raised %s" % (f, _REDACTED, type(x).__name__)
+                else:
+                    message = "%s(%r) raised %r" % (f, data, x)
                 message = self._prepend_schema_name(message)
-                raise SchemaError(message, e.format(data) if e else None)
-            message = "%s(%r) should evaluate to True" % (f, data)
+                raise _mark_secret(
+                    SchemaError(
+                        message, e.format(_safe_data(data, secret)) if e else None
+                    ),
+                    secret,
+                )
+            message = "%s(%r) should evaluate to True" % (f, _safe_data(data, secret))
             message = self._prepend_schema_name(message)
-            raise SchemaError(message, e.format(data) if e else None)
+            raise _mark_secret(
+                SchemaError(
+                    message, e.format(_safe_data(data, secret)) if e else None
+                ),
+                secret,
+            )
         if s == data:
             return data
         else:
-            message = "%r does not match %r" % (s, data)
+            message = "%r does not match %r" % (s, _safe_data(data, secret))
             message = self._prepend_schema_name(message)
-            raise SchemaError(message, e.format(data) if e else None)
+            raise _mark_secret(
+                SchemaError(
+                    message, e.format(_safe_data(data, secret)) if e else None
+                ),
+                secret,
+            )
 
     def json_schema(
         self, schema_id: str, use_refs: bool = False, **kwargs: Any
@@ -937,8 +1221,14 @@ class Forbidden(Hook):
 
     @staticmethod
     def _default_function(nkey: Any, data: Any, error: Any) -> NoReturn:
-        raise SchemaForbiddenKeyError(
-            f"Forbidden key encountered: {nkey!r} in {data!r}", error
+        secret = _secret_active()
+        raise _mark_secret(
+            SchemaForbiddenKeyError(
+                "Forbidden key encountered: %r in %r"
+                % (nkey, _safe_data(data, secret)),
+                error,
+            ),
+            secret,
         )
 
 
