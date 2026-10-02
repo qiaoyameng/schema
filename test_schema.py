@@ -21,6 +21,7 @@ from schema import (
     Const,
     Forbidden,
     Hook,
+    KeyDependentValue,
     Literal,
     Optional,
     Or,
@@ -29,7 +30,9 @@ from schema import (
     SchemaError,
     SchemaForbiddenKeyError,
     SchemaMissingKeyError,
+    SchemaSelectorError,
     SchemaUnexpectedTypeError,
+    SchemaUnknownKeyError,
     SchemaWrongKeyError,
     Use,
 )
@@ -475,6 +478,102 @@ def test_wrong_key_reports_key_schema_error():
         assert e.code == "must be upper"
     else:
         raise AssertionError("SchemaWrongKeyError not raised")
+
+
+def test_key_dependent_value():
+    # A report keyed by version: "v1" values use the old structure,
+    # "v2" values the new one.
+    calls = []
+    value_schemas = {"v1": {"old": int}, "v2": {"new": str}}
+
+    def selector(key):
+        calls.append(key)
+        return value_schemas[key]
+
+    s = Schema({str: KeyDependentValue(selector)})
+
+    # Same schema, reversed key order across calls: the rule selected for
+    # the first call must not be cached and reused for the second one.
+    v2 = s.validate({"v2": {"new": "x"}})
+    v1 = s.validate({"v1": {"old": 1}})
+    assert v2 == {"v2": {"new": "x"}}
+    assert v1 == {"v1": {"old": 1}}
+    assert calls == ["v2", "v1"]
+
+    # Each mapping item is selected exactly once, per call.
+    del calls[:]
+    both = s.validate({"v1": {"old": 2}, "v2": {"new": "y"}})
+    assert both == {"v1": {"old": 2}, "v2": {"new": "y"}}
+    assert sorted(calls) == ["v1", "v2"]
+
+    # An unknown version is reported as such, not as an invalid value.
+    with raises(SchemaUnknownKeyError) as excinfo:
+        s.validate({"v3": {"old": 1}})
+    assert "No value schema for key 'v3'" in excinfo.value.code
+
+    # A value that does not match the selected schema is a plain
+    # SchemaError keeping the key path, not a selection error.
+    with raises(SchemaError) as excinfo:
+        s.validate({"v1": {"old": "x"}})
+    assert not isinstance(
+        excinfo.value, (SchemaUnknownKeyError, SchemaSelectorError)
+    )
+    assert "Key 'v1' error:" in excinfo.value.code
+    assert "'x' should be instance of 'int'" in excinfo.value.code
+
+
+def test_key_dependent_value_selector_exception():
+    def selector(key):
+        raise ValueError("boom")
+
+    s = Schema({str: KeyDependentValue(selector)})
+    with raises(SchemaSelectorError) as excinfo:
+        s.validate({"v1": 1})
+    assert "raised ValueError('boom')" in excinfo.value.code
+
+    # A non-callable selector is rejected up front.
+    with raises(TypeError):
+        KeyDependentValue("not-callable")
+
+
+def test_key_dependent_value_transformed_key():
+    # The selector sees the transformed key (after the key schema ran);
+    # the raw key is kept for error reporting.
+    calls = []
+
+    def selector(key):
+        calls.append(key)
+        if key == 1:
+            return int
+        raise KeyError(key)
+
+    s = Schema({Use(int): KeyDependentValue(selector)})
+    assert s.validate({"1": 5}) == {1: 5}
+    assert calls == [1]
+
+    with raises(SchemaUnknownKeyError) as excinfo:
+        s.validate({"2": 5})
+    assert "No value schema for key 2" in excinfo.value.code
+    assert "(raw key '2')" in excinfo.value.code
+
+
+def test_key_dependent_value_nested_path():
+    # Nested validation keeps the key path through selected schemas.
+    s = Schema({"report": {str: KeyDependentValue({"v1": {"old": int}}.__getitem__)}})
+    with raises(SchemaError) as excinfo:
+        s.validate({"report": {"v1": {"old": "x"}}})
+    assert "Key 'report' error:" in excinfo.value.code
+    assert "Key 'v1' error:" in excinfo.value.code
+    with raises(SchemaUnknownKeyError) as excinfo:
+        s.validate({"report": {"v9": {}}})
+    assert "Key 'report' error:" in excinfo.value.code
+    assert "No value schema for key 'v9'" in excinfo.value.code
+
+
+def test_key_dependent_value_outside_dict():
+    with raises(SchemaError) as excinfo:
+        Schema(KeyDependentValue(lambda key: int)).validate(1)
+    assert "can only be used as the value of a dict schema" in excinfo.value.code
 
 
 def test_complex():

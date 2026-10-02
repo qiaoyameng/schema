@@ -417,6 +417,50 @@ Here's an example where a `Deprecated` class is added to log warnings whenever a
     ...
     WARNING: `test` is deprecated. custom error message.
 
+Key-dependent values
+~~~~~~~~~~~~~~~~~~~~
+
+When a mapping is keyed by something like a version tag, the structure of
+each value may depend on the key that actually matched. ``KeyDependentValue``
+selects the value schema per mapping item with a selector callable that the
+program provides explicitly — the validated data itself can never make it
+reach an arbitrary class or function:
+
+.. code:: python
+
+    >>> from schema import Schema, KeyDependentValue
+
+    >>> value_schemas = {"v1": {"old": int}, "v2": {"new": str}}
+    >>> s = Schema({str: KeyDependentValue(value_schemas.__getitem__)})
+    >>> s.validate({"v1": {"old": 1}, "v2": {"new": "x"}})
+    {'v1': {'old': 1}, 'v2': {'new': 'x'}}
+
+The selector is called exactly once per mapping item with the *transformed*
+key (the data key after the key schema validated and possibly converted it);
+the raw key is kept for error reporting. The chosen schema is never cached,
+so different keys and different ``validate()`` calls never share the
+selected rule.
+
+If the selector raises ``KeyError`` (as ``dict.__getitem__`` does), the key
+is reported as unknown via ``SchemaUnknownKeyError``; any other exception
+raised by the selector itself becomes ``SchemaSelectorError``. Both are
+distinct from a value that simply fails the selected schema, which raises a
+regular ``SchemaError`` with the usual ``Key '<key>' error:`` path:
+
+.. code:: python
+
+    >>> s.validate({"v3": {}})
+    Traceback (most recent call last):
+    ...
+    schema.SchemaUnknownKeyError: No value schema for key 'v3'
+
+    >>> s.validate({"v1": {"old": "x"}})
+    Traceback (most recent call last):
+    ...
+    schema.SchemaError: Key 'v1' error:
+    Key 'old' error:
+    'x' should be instance of 'int'
+
 Extra Keys
 ~~~~~~~~~~
 

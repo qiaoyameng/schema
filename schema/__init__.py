@@ -45,12 +45,15 @@ __all__ = [
     "Forbidden",
     "Const",
     "Literal",
+    "KeyDependentValue",
     "SchemaError",
     "SchemaWrongKeyError",
     "SchemaMissingKeyError",
     "SchemaForbiddenKeyError",
     "SchemaUnexpectedTypeError",
     "SchemaOnlyOneAllowedError",
+    "SchemaUnknownKeyError",
+    "SchemaSelectorError",
 ]
 
 
@@ -104,6 +107,25 @@ class SchemaOnlyOneAllowedError(SchemaError):
     """Error should be raised when an only_one Or key has multiple matching candidates"""
 
     pass
+
+
+class SchemaUnknownKeyError(SchemaError):
+    """Error should be raised when a key-dependent value selector has no
+    schema for the key that actually matched (e.g. an unknown version)"""
+
+    pass
+
+
+class SchemaSelectorError(SchemaError):
+    """Error should be raised when a key-dependent value selector itself
+    raised an unexpected exception"""
+
+    pass
+
+
+# Selection failures of KeyDependentValue stay distinguishable from plain
+# value errors even when nested validation adds key-path context.
+_SELECTION_ERROR_TYPES = (SchemaUnknownKeyError, SchemaSelectorError)
 
 
 class SchemaForbiddenKeyError(SchemaError):
@@ -331,6 +353,87 @@ class Use:
 COMPARABLE, CALLABLE, VALIDATOR, TYPE, DICT, ITERABLE = range(6)
 
 
+class KeyDependentValue:
+    """
+    Selects the value schema of a mapping item based on the key that
+    actually matched, e.g. a report keyed by version where "v1" values
+    use the old structure and "v2" values the new one:
+
+        Schema({str: KeyDependentValue({"v1": old_schema,
+                                        "v2": new_schema}.__getitem__)})
+
+    The selector is a callable provided explicitly by the program; it is
+    never looked up from the validated data, so untrusted input cannot
+    make it reach arbitrary classes or functions.
+
+    The selector is called exactly once per mapping item with the
+    *transformed* key (the data key after the key schema has validated
+    and possibly converted it). Both the transformed and the raw key are
+    kept so that selection failures can report them. The chosen schema is
+    a local of that one item: nothing is cached, so different keys and
+    different validate() calls never share selection state.
+
+    The selector must return a schema for the value. Raising ``KeyError``
+    signals an unknown key (e.g. an unknown version) and is reported as
+    :class:`SchemaUnknownKeyError`; any other exception raised by the
+    selector itself is reported as :class:`SchemaSelectorError`. Both are
+    distinct from the value simply not validating against the selected
+    schema, which raises a regular ``SchemaError`` prefixed with the
+    usual "Key '<key>' error:" path.
+    """
+
+    def __init__(
+        self,
+        selector: Callable[[Any], Any],
+        error: Union[str, None] = None,
+    ) -> None:
+        if not callable(selector):
+            raise TypeError(f"Expected a callable, not {selector!r}")
+        self._selector: Callable[[Any], Any] = selector
+        self._error: Union[str, None] = error
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self._selector!r})"
+
+    @property
+    def selector(self) -> Callable[[Any], Any]:
+        """The provided selector callable"""
+        return self._selector
+
+    def select(self, nkey: Any, key: Any) -> Any:
+        """Choose the value schema for one mapping item.
+
+        :param nkey: the transformed key, after key-schema validation.
+        :param key: the raw key, as it appeared in the data.
+        :return: the schema the value must be validated against.
+        """
+        try:
+            return self._selector(nkey)
+        except SchemaError:
+            raise
+        except KeyError:
+            message = "No value schema for key %r" % (nkey,)
+            if key != nkey:
+                message += " (raw key %r)" % (key,)
+            raise SchemaUnknownKeyError(
+                message, self._error.format(key) if self._error else None
+            )
+        except BaseException as x:
+            f = _callable_str(self._selector)
+            message = "%s(%r) raised %r" % (f, nkey, x)
+            if key != nkey:
+                message += " (raw key %r)" % (key,)
+            raise SchemaSelectorError(
+                message, self._error.format(key) if self._error else None
+            )
+
+    def validate(self, data: Any, **kwargs: Any) -> Any:
+        raise SchemaError(
+            "%r can only be used as the value of a dict schema, where "
+            "the matched key selects the schema" % (self,)
+        )
+
+
 def _priority(s: Any) -> int:
     """Return priority for a given object."""
     if type(s) in (list, tuple, set, frozenset):
@@ -495,6 +598,14 @@ class Schema(object):
                                     continue
                                 skey.handler(nkey, data, e)
                             else:
+                                if isinstance(svalue, KeyDependentValue):
+                                    # Choose the value schema for this item
+                                    # only, based on the key that matched.
+                                    # Selection errors (unknown key, selector
+                                    # failure) propagate unwrapped so they
+                                    # stay distinguishable from a value that
+                                    # simply does not validate.
+                                    svalue = svalue.select(nkey, key)
                                 try:
                                     nvalue = Schema(
                                         svalue, error=e, ignore_extra_keys=i
@@ -502,7 +613,15 @@ class Schema(object):
                                 except SchemaError as x:
                                     k = "Key '%s' error:" % (nkey,)
                                     message = self._prepend_schema_name(k)
-                                    raise SchemaError(
+                                    # Selection failures keep their type so
+                                    # they stay distinguishable from a value
+                                    # that simply does not validate.
+                                    error_class = (
+                                        x.__class__
+                                        if isinstance(x, _SELECTION_ERROR_TYPES)
+                                        else SchemaError
+                                    )
+                                    raise error_class(
                                         [message] + x.autos,
                                         [e.format(data) if e else None] + x.errors,
                                     )
@@ -569,7 +688,12 @@ class Schema(object):
             try:
                 return s.validate(data, **kwargs)
             except SchemaError as x:
-                raise SchemaError(
+                error_class = (
+                    x.__class__
+                    if isinstance(x, _SELECTION_ERROR_TYPES)
+                    else SchemaError
+                )
+                raise error_class(
                     [None] + x.autos, [e.format(data) if e else None] + x.errors
                 )
             except BaseException as x:
