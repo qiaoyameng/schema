@@ -25,6 +25,7 @@ from schema import (
     Optional,
     Or,
     Regex,
+    Secret,
     Schema,
     SchemaError,
     SchemaForbiddenKeyError,
@@ -2100,3 +2101,206 @@ def test_tuple_key_error_message_does_not_crash():
     with raises(SchemaError) as exc_info:
         Schema({("a", "b"): int}).validate({("a", "b"): "not-an-int"})
     assert "Key '('a', 'b')' error:" in exc_info.value.code
+
+
+# Token containing regex/format/shell special characters; it must never show
+# up in any public stringification of a validation error.
+SECRET_TOKEN = "t0k#n!$%^&*()_+=-[]{}|;:,.<>?/@特殊"
+
+
+def _assert_no_token(exc):
+    assert SECRET_TOKEN not in exc.code
+    assert SECRET_TOKEN not in str(exc)
+    assert SECRET_TOKEN not in repr(exc)
+    assert all(SECRET_TOKEN not in a for a in exc.autos if a)
+    assert all(SECRET_TOKEN not in m for m in exc.errors if m)
+    import traceback
+
+    formatted = "".join(
+        traceback.format_exception(type(exc), exc, exc.__traceback__)
+    )
+    assert SECRET_TOKEN not in formatted
+
+
+def test_secret_success_returns_original_value():
+    assert Schema(Secret(str)).validate(SECRET_TOKEN) == SECRET_TOKEN
+    assert Schema(Secret(Use(int))).validate("42") == 42
+    assert Schema({"token": Secret(str)}).validate({"token": SECRET_TOKEN}) == {
+        "token": SECRET_TOKEN
+    }
+
+
+def test_secret_outer_failure_type_mismatch():
+    with raises(SchemaError) as exc_info:
+        Schema({"token": Secret(str)}).validate({"token": 1})
+    e = exc_info.value
+    _assert_no_token(e)
+    assert "Key 'token' error:" in e.code
+    assert "<secret> should be instance of 'str'" in e.code
+
+
+def test_secret_outer_failure_regex():
+    with raises(SchemaError) as exc_info:
+        Schema({"token": Secret(Regex(r"^good$"))}).validate(
+            {"token": SECRET_TOKEN}
+        )
+    e = exc_info.value
+    _assert_no_token(e)
+    assert "Key 'token' error:" in e.code
+    assert "<secret> does not match" in e.code
+    assert "^good$" in e.code
+
+
+def test_secret_inner_failure_use_value_error():
+    def check_token(value):
+        if value != "good":
+            raise ValueError("token %s is rejected" % value)
+        return value
+
+    with raises(SchemaError) as exc_info:
+        Schema({"token": Secret(And(str, Use(check_token)))}).validate(
+            {"token": SECRET_TOKEN}
+        )
+    e = exc_info.value
+    _assert_no_token(e)
+    assert "Key 'token' error:" in e.code
+    assert "check_token(<secret>) raised ValueError" in e.code
+
+
+def test_secret_inner_failure_use_schema_error_is_degraded():
+    # A user validator that builds its own SchemaError embedding the secret:
+    # the text is dropped wholesale, not scrubbed by string substitution.
+    def check_token(value):
+        raise SchemaError("self built failure: %s" % value)
+
+    with raises(SchemaError) as exc_info:
+        Schema({"token": Secret(Use(check_token))}).validate(
+            {"token": SECRET_TOKEN}
+        )
+    e = exc_info.value
+    _assert_no_token(e)
+    assert "Key 'token' error:" in e.code
+    assert "check_token(<secret>)" in e.code
+    assert "error details withheld for secret input" in e.code
+
+
+def test_secret_plain_callable_schema_error_is_degraded():
+    def callable_validator(value):
+        raise SchemaError("self built failure: %s" % value)
+
+    with raises(SchemaError) as exc_info:
+        Schema(Secret(callable_validator)).validate(SECRET_TOKEN)
+    e = exc_info.value
+    _assert_no_token(e)
+    assert "callable_validator(<secret>)" in e.code
+    assert "error details withheld for secret input" in e.code
+
+
+def test_secret_custom_validator_schema_error_is_degraded():
+    class CustomValidator:
+        def validate(self, value):
+            raise SchemaError("self built failure: %s" % value)
+
+    with raises(SchemaError) as exc_info:
+        Schema(Secret(CustomValidator())).validate(SECRET_TOKEN)
+    e = exc_info.value
+    _assert_no_token(e)
+    assert "CustomValidator.validate(<secret>)" in e.code
+    assert "error details withheld for secret input" in e.code
+
+
+def test_secret_user_schema_subclass_is_not_trusted():
+    # A Schema subclass living outside the library may build leaking
+    # messages in validate(); it must be redacted like any other validator.
+    class LeakySchema(Schema):
+        def validate(self, data, **kwargs):
+            raise SchemaError("self built failure: %s" % data)
+
+    with raises(SchemaError) as exc_info:
+        Schema(Secret(LeakySchema(int))).validate(SECRET_TOKEN)
+    e = exc_info.value
+    _assert_no_token(e)
+    assert "LeakySchema.validate(<secret>)" in e.code
+    assert "error details withheld for secret input" in e.code
+
+
+def test_secret_custom_error_template_redacts_value():
+    with raises(SchemaError) as exc_info:
+        Schema(
+            {"token": Secret(And(str, Use(int), error="bad token {}"))}
+        ).validate({"token": SECRET_TOKEN})
+    e = exc_info.value
+    _assert_no_token(e)
+    assert "bad token <secret>" in e.code
+
+
+def test_secret_propagates_through_or():
+    with raises(SchemaError) as exc_info:
+        Schema({"token": Secret(Or(int, Regex(r"^\d+$")))}).validate(
+            {"token": SECRET_TOKEN}
+        )
+    e = exc_info.value
+    _assert_no_token(e)
+    assert "Key 'token' error:" in e.code
+    assert "Or(" in e.code
+    assert "did not validate <secret>" in e.code
+
+
+def test_secret_inside_or_branch_propagates_to_sibling_messages():
+    # A secret branch must protect messages produced by non-secret siblings
+    # as well, since they all validate the same input.
+    with raises(SchemaError) as exc_info:
+        Schema(Or(Secret(int), Regex(r"^\d+$"))).validate(SECRET_TOKEN)
+    e = exc_info.value
+    _assert_no_token(e)
+    assert "did not validate <secret>" in e.code
+
+
+def test_secret_propagates_through_nested_mapping():
+    with raises(SchemaError) as exc_info:
+        Schema({"outer": {"inner": Secret(str)}}).validate(
+            {"outer": {"inner": 1}}
+        )
+    e = exc_info.value
+    _assert_no_token(e)
+    assert "Key 'outer' error:" in e.code
+    assert "Key 'inner' error:" in e.code
+    assert "1" not in e.code
+
+
+def test_secret_propagates_through_sequence():
+    with raises(SchemaError) as exc_info:
+        Schema([Secret(str)]).validate([1])
+    e = exc_info.value
+    _assert_no_token(e)
+    assert "<secret>" in e.code
+
+
+def test_secret_wrapper_does_not_reveal_inner_rule_in_repr():
+    secret = Secret(And(str, Regex(r"^t0k.*$")))
+    assert SECRET_TOKEN not in repr(secret)
+    assert repr(secret) == "Secret(<secret>)"
+    assert Or(secret).__repr__() == "Or(Secret(<secret>))"
+
+
+def test_secret_is_valid():
+    assert Schema(Secret(str)).is_valid(SECRET_TOKEN) is True
+    assert Schema(Secret(str)).is_valid(1) is False
+
+
+def test_unmarked_rules_keep_original_error_format():
+    # Existing (non-secret) behavior is unchanged, including exposing input.
+    with raises(SchemaError) as exc_info:
+        Schema(int).validate(SECRET_TOKEN)
+    assert repr(SECRET_TOKEN) in exc_info.value.code
+
+    def check(value):
+        raise ValueError("token %s is rejected" % value)
+
+    with raises(SchemaError) as exc_info:
+        Schema(Use(check)).validate(SECRET_TOKEN)
+    assert SECRET_TOKEN in exc_info.value.code
+
+    with raises(SchemaError) as exc_info:
+        Schema(And(str, Use(int), error="bad token {}")).validate(SECRET_TOKEN)
+    assert "bad token %s" % SECRET_TOKEN in exc_info.value.code
