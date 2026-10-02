@@ -18,16 +18,22 @@ from pytest import mark, raises
 
 from schema import (
     And,
+    COUNT_FILLED,
+    COUNT_RAW,
     Const,
     Forbidden,
+    Group,
+    GroupMember,
     Hook,
     Literal,
     Optional,
     Or,
     Regex,
+    Required,
     Schema,
     SchemaError,
     SchemaForbiddenKeyError,
+    SchemaGroupError,
     SchemaMissingKeyError,
     SchemaUnexpectedTypeError,
     SchemaWrongKeyError,
@@ -2100,3 +2106,270 @@ def test_tuple_key_error_message_does_not_crash():
     with raises(SchemaError) as exc_info:
         Schema({("a", "b"): int}).validate({("a", "b"): "not-an-int"})
     assert "Key '('a', 'b')' error:" in exc_info.value.code
+
+
+def _connection_schema(**group_kwargs):
+    auth = Group("auth", min_count=2, **group_kwargs)
+    proxy = Group("proxy", max_count=1, **group_kwargs)
+    return Schema(
+        {
+            auth(Optional("username")): str,
+            auth(Optional("password")): str,
+            auth(Optional("token")): str,
+            proxy(Optional("http_proxy")): str,
+            proxy(Optional("https_proxy")): str,
+        },
+        ignore_extra_keys=True,
+    )
+
+
+def test_group_at_least_two_auth_fields():
+    schema = _connection_schema()
+    assert schema.validate(
+        {"username": "u", "password": "p", "http_proxy": "h"}
+    ) == {"username": "u", "password": "p", "http_proxy": "h"}
+    with raises(SchemaGroupError) as exc_info:
+        schema.validate({"username": "u", "http_proxy": "h"})
+    message = str(exc_info.value)
+    assert "Group 'auth'" in message
+    assert "found 1 present key(s)" in message
+    assert "'username'" in message
+
+
+def test_group_at_most_one_proxy_spelling():
+    schema = _connection_schema()
+    with raises(SchemaGroupError) as exc_info:
+        schema.validate(
+            {
+                "username": "u",
+                "password": "p",
+                "http_proxy": "h",
+                "https_proxy": "h2",
+            }
+        )
+    message = str(exc_info.value)
+    assert "Group 'proxy'" in message
+    assert "found 2 present key(s)" in message
+    assert "'http_proxy'" in message
+    assert "'https_proxy'" in message
+
+
+def test_group_bad_value_is_not_reported_as_missing():
+    # A present key whose value fails validation raises the value error;
+    # it must never be counted as a missing group member.
+    schema = _connection_schema()
+    with raises(SchemaError) as exc_info:
+        schema.validate({"username": "u", "password": 1, "http_proxy": "h"})
+    assert not isinstance(exc_info.value, SchemaGroupError)
+    assert "Key 'password' error:" in str(exc_info.value)
+
+
+def test_group_error_does_not_leak_values():
+    schema = _connection_schema()
+    with raises(SchemaGroupError) as exc_info:
+        schema.validate({"username": "SUPER-SECRET-VALUE", "http_proxy": "h"})
+    assert "SUPER-SECRET-VALUE" not in str(exc_info.value)
+
+
+def test_group_overlapping_groups_count_separately():
+    one = Group("one", min_count=1)
+    at_most_one = Group("at_most_one", max_count=1)
+    schema = Schema(
+        {
+            one(Optional(And(str, Regex(r"^auth_")))): object,
+            at_most_one(Optional(And(str, Regex(r"_")))): object,
+            at_most_one(Optional("other")): object,
+        },
+        ignore_extra_keys=True,
+    )
+    # 'auth_x' belongs to both groups and is counted in each of them
+    assert schema.validate({"auth_x": 1}) == {"auth_x": 1}
+    with raises(SchemaGroupError):
+        schema.validate({"a_b": 1, "other": 2})
+    with raises(SchemaGroupError):
+        schema.validate({"other": 2})
+
+
+def test_group_same_input_key_matches_multiple_members_once():
+    group = Group("g", min_count=1, max_count=1)
+    schema = Schema(
+        {
+            group(Optional(And(str, Regex(r"^auth_")))): object,
+            group(Optional(And(str, Regex(r"_")))): object,
+        },
+        ignore_extra_keys=True,
+    )
+    # Both member patterns match 'auth_x', but the key counts only once
+    assert schema.validate({"auth_x": 1}) == {"auth_x": 1}
+    assert not schema.is_valid({})
+
+
+def test_group_raw_vs_filled_default_counting():
+    raw = Schema(
+        {
+            Group("g", min_count=1, count=COUNT_RAW)(
+                Optional("a", default=1)
+            ): int
+        }
+    )
+    filled = Schema(
+        {
+            Group("g", min_count=1, count=COUNT_FILLED)(
+                Optional("a", default=1)
+            ): int
+        }
+    )
+    assert raw.validate({"a": 5}) == {"a": 5}
+    assert not raw.is_valid({})
+    assert filled.validate({}) == {"a": 1}
+
+
+def test_group_filled_counting_ignores_unused_member_without_default():
+    group = Group("g", min_count=1, max_count=1, count=COUNT_FILLED)
+    schema = Schema(
+        {
+            group(Optional("a", default=1)): int,
+            group(Optional("b")): int,
+        }
+    )
+    assert schema.validate({}) == {"a": 1}
+
+
+def test_group_works_with_required_marker():
+    group = Group("g", min_count=1)
+    schema = Schema(
+        {group(Required("must")): int, group(Optional("b")): int},
+        ignore_extra_keys=True,
+    )
+    assert schema.validate({"must": 1}) == {"must": 1}
+    with raises(SchemaMissingKeyError):
+        schema.validate({"b": 1})
+
+
+def test_group_with_regex_and_key_validators():
+    group = Group("proxy", max_count=1)
+    schema = Schema(
+        {
+            group(Optional(And(str, Regex(r"_proxy$")))): str,
+            group(Optional("proxy_url")): str,
+            str: object,
+        }
+    )
+    assert schema.validate({"http_proxy": "h", "note": 1}) == {
+        "http_proxy": "h",
+        "note": 1,
+    }
+    with raises(SchemaGroupError):
+        schema.validate({"http_proxy": "h", "https_proxy": "h2", "note": 1})
+
+
+def test_group_result_independent_of_dict_iteration_order():
+    from itertools import permutations
+
+    one = Group("one", min_count=1)
+    at_most_one = Group("at_most_one", max_count=1)
+    schema = Schema(
+        {
+            one(Optional(And(str, Regex(r"^auth_")))): object,
+            at_most_one(Optional(And(str, Regex(r"_")))): object,
+            at_most_one(Optional("other")): object,
+        },
+        ignore_extra_keys=True,
+    )
+    items = [("auth_x", 1), ("a_b", 2), ("other", 3)]
+    outcomes = set()
+    for order in permutations(items):
+        try:
+            schema.validate(dict(order))
+        except SchemaGroupError as error:
+            outcomes.add(("error", str(error)))
+        else:
+            outcomes.add(("ok",))
+    assert len(outcomes) == 1
+
+
+def test_group_repeated_validation_is_stable():
+    group = Group("g", min_count=1)
+    schema = Schema(
+        {
+            group(Optional(Or("a", "b", only_one=True))): str,
+            group(Optional("c")): str,
+        },
+        ignore_extra_keys=True,
+    )
+    for _ in range(3):
+        assert schema.validate({"a": "x"}) == {"a": "x"}
+        assert schema.validate({"c": "x"}) == {"c": "x"}
+    with raises(SchemaError):
+        schema.validate({"a": "x", "b": "y"})
+
+
+def test_group_shared_instance_across_schemas():
+    group = Group("shared", min_count=1, max_count=2)
+    schema_two = Schema(
+        {group(Optional("p")): int, group(Optional("q")): int}
+    )
+    schema_three = Schema(
+        {
+            group(Optional("p")): int,
+            group(Optional("q")): int,
+            group(Optional("r")): int,
+        }
+    )
+    assert not schema_two.is_valid({})
+    assert schema_two.validate({"p": 1, "q": 2}) == {"p": 1, "q": 2}
+    assert not schema_three.is_valid({"p": 1, "q": 2, "r": 3})
+
+
+def test_group_invalid_constructions():
+    with raises(ValueError):
+        Group("g", min_count=-1)
+    with raises(ValueError):
+        Group("g", max_count=1.5)
+    with raises(ValueError):
+        Group("g", min_count=3, max_count=1)
+    with raises(ValueError):
+        Group("g", count="surprise")
+    with raises(TypeError):
+        Group(123)
+    # bool is not accepted as a cardinality
+    with raises(ValueError):
+        Group("g", min_count=True)
+
+
+def test_group_boundary_counts():
+    group = Group("g", min_count=2, max_count=2)
+    schema = Schema(
+        {group(Optional(letter)): int for letter in ("a", "b", "c")}
+    )
+    assert not schema.is_valid({"a": 1})
+    assert schema.validate({"a": 1, "b": 2}) == {"a": 1, "b": 2}
+    assert not schema.is_valid({"a": 1, "b": 2, "c": 3})
+
+
+def test_required_marker_matches_plain_required_key():
+    plain = Schema({"a": int, "b": int})
+    marked = Schema({Required("a"): int, Required("b"): int})
+    assert marked.validate({"a": 1, "b": 2}) == {"a": 1, "b": 2}
+    assert plain.is_valid({"a": 1}) == marked.is_valid({"a": 1})
+
+
+def test_group_member_marker_wraps_key_schema():
+    group = Group("g", min_count=1)
+    member = group("a")
+    assert isinstance(member, GroupMember)
+    assert member.group is group
+    assert member.schema == "a"
+    assert "GroupMember" in repr(member)
+
+
+def test_group_json_schema_unwraps_markers():
+    group = Group("g", min_count=1)
+    json_schema = Schema(
+        {
+            group(Required("a")): int,
+            group(Optional("b", default=2)): int,
+        }
+    ).json_schema("http://example.com")
+    assert json_schema["required"] == ["a"]
+    assert json_schema["properties"]["b"]["default"] == 2

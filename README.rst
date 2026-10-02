@@ -357,6 +357,60 @@ so, use the `Or` class as a key:
     ...
     schema.SchemaOnlyOneAllowedError: There are multiple keys present from the Or('key1', 'key2') condition
 
+Field groups
+~~~~~~~~~~~~
+
+Sometimes a set of keys obeys a cardinality rule on its own: for example a
+connection configuration may require at least two authentication fields while
+accepting only one spelling of the proxy address. Use ``Group`` and call it
+on the keys that belong to the group:
+
+.. code:: python
+
+    >>> from schema import Group, Optional, Schema
+    >>> auth = Group('auth', min_count=2)
+    >>> proxy = Group('proxy', max_count=1)
+    >>> connection = Schema({
+    ...     auth(Optional('username')): str,
+    ...     auth(Optional('password')): str,
+    ...     auth(Optional('token')): str,
+    ...     proxy(Optional('http_proxy')): str,
+    ...     proxy(Optional('https_proxy')): str,
+    ... }, ignore_extra_keys=True)
+
+    >>> connection.validate({'username': 'u', 'password': 'p', 'http_proxy': 'h'})
+    {'username': 'u', 'password': 'p', 'http_proxy': 'h'}
+
+    >>> connection.validate({'username': 'u', 'http_proxy': 'h'})
+    Traceback (most recent call last):
+    ...
+    schema.SchemaGroupError: Group 'auth' requires between 2 and any present key(s), found 1 present key(s): 'username'
+
+A key may belong to several overlapping groups and is counted in each of them;
+within one group an input key is counted only once even if several member
+patterns (such as regular expressions) match it.
+
+By default presence is measured against the **raw input** only. Pass
+``count=COUNT_FILLED`` to also count optional members that were filled in
+with their ``default``:
+
+.. code:: python
+
+    >>> from schema import COUNT_FILLED, COUNT_RAW
+    >>> Schema({
+    ...     Group('g', min_count=1, count=COUNT_RAW)(Optional('a', default=1)): int,
+    ... }).is_valid({})
+    False
+    >>> Schema({
+    ...     Group('g', min_count=1, count=COUNT_FILLED)(Optional('a', default=1)): int,
+    ... }).validate({})
+    {'a': 1}
+
+Group cardinality is checked after value validation, so a present field with
+a wrong value is reported as a value error rather than a missing group member.
+Group errors name the group and the keys that were present, but never contain
+field values.
+
 Hooks
 ~~~~~~~~~~
 You can define hooks which are functions that are executed whenever a valid key:value is found.

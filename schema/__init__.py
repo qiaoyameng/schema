@@ -40,7 +40,10 @@ __all__ = [
     "And",
     "Or",
     "Regex",
+    "Required",
     "Optional",
+    "Group",
+    "GroupMember",
     "Use",
     "Forbidden",
     "Const",
@@ -51,6 +54,7 @@ __all__ = [
     "SchemaForbiddenKeyError",
     "SchemaUnexpectedTypeError",
     "SchemaOnlyOneAllowedError",
+    "SchemaGroupError",
 ]
 
 
@@ -102,6 +106,12 @@ class SchemaMissingKeyError(SchemaError):
 
 class SchemaOnlyOneAllowedError(SchemaError):
     """Error should be raised when an only_one Or key has multiple matching candidates"""
+
+    pass
+
+
+class SchemaGroupError(SchemaError):
+    """Error raised when a field group contains too many or too few present keys"""
 
     pass
 
@@ -331,8 +341,20 @@ class Use:
 COMPARABLE, CALLABLE, VALIDATOR, TYPE, DICT, ITERABLE = range(6)
 
 
+# Field-group presence counting modes:
+# COUNT_RAW counts only keys present in the original input,
+# COUNT_FILLED also counts optional keys that were filled with their default.
+COUNT_RAW = "raw"
+COUNT_FILLED = "filled"
+
+
 def _priority(s: Any) -> int:
     """Return priority for a given object."""
+    inner = _unwrap_marker(s)
+    if inner is not s:
+        # Required/GroupMember are Schema subclasses and validate their inner
+        # key schema, so keep dispatching them as validators.
+        return VALIDATOR
     if type(s) in (list, tuple, set, frozenset):
         return ITERABLE
     if isinstance(s, dict):
@@ -345,8 +367,43 @@ def _priority(s: Any) -> int:
         return VALIDATOR
     if callable(s):
         return CALLABLE
-    else:
-        return COMPARABLE
+    return COMPARABLE
+
+
+def _unwrap_marker(s: Any) -> Any:
+    """Return the plain key schema wrapped by a key marker (Required/GroupMember)."""
+    if isinstance(s, GroupMember):
+        return s.schema
+    if isinstance(s, Required):
+        return s.schema
+    return s
+
+
+def _iter_ors(s: Any) -> Iterable["Or"]:
+    """Yield all Or instances contained in a key schema.
+
+    Key matching runs more than once for field-group counting, so Or
+    match_count state has to be restored afterwards to keep only_one working.
+    """
+    seen: Set[int] = set()
+
+    def walk(x: Any) -> Iterable["Or"]:
+        if id(x) in seen:
+            return
+        seen.add(id(x))
+        if isinstance(x, Or):
+            yield x
+        if isinstance(x, And):
+            for arg in x.args:
+                for or_ in walk(arg):
+                    yield or_
+        inner = getattr(x, "_schema", None)
+        if inner is not None:
+            for or_ in walk(inner):
+                yield or_
+
+    for or_ in walk(s):
+        yield or_
 
 
 def _invoke_with_optional_kwargs(f: Callable[..., Any], **kwargs: Any) -> Any:
@@ -403,6 +460,8 @@ class Schema(object):
     @staticmethod
     def _dict_key_priority(s) -> float:
         """Return priority for a given key object."""
+        if isinstance(s, GroupMember):
+            return Schema._dict_key_priority(s.schema)
         if isinstance(s, Hook):
             return _priority(s._schema) - 0.5
         if isinstance(s, Optional):
@@ -412,7 +471,61 @@ class Schema(object):
     @staticmethod
     def _is_optional_type(s: Any) -> bool:
         """Return True if the given key is optional (does not have to be found)"""
-        return any(isinstance(s, optional_type) for optional_type in [Optional, Hook])
+        if isinstance(s, GroupMember):
+            return Schema._is_optional_type(s.schema)
+        return any(
+            isinstance(s, optional_type) for optional_type in [Optional, Hook]
+        )
+
+    @staticmethod
+    def _optional_marker(s: Any) -> Any:
+        """Return the Optional/Hook marker carried by a dict key, if any."""
+        if isinstance(s, GroupMember):
+            return Schema._optional_marker(s.schema)
+        if isinstance(s, (Optional, Hook)):
+            return s
+        return None
+
+    def _member_key_matches(
+        self, member: "GroupMember", raw_key: Any, error: Any, kwargs: Dict[str, Any]
+    ) -> bool:
+        """Check whether a raw input key matches a field-group member.
+
+        Several patterns inside the same group may match the same key; the
+        caller stores results per input key so it is counted only once.
+        Or keys mutate their match_count, so the state is restored.
+        """
+        ors = list(_iter_ors(member.schema))
+        saved = [(or_, or_.match_count) for or_ in ors]
+        try:
+            Schema(member, error=error).validate(raw_key, **kwargs)
+        except SchemaError:
+            return False
+        finally:
+            for or_, count in saved:
+                or_.match_count = count
+        return True
+
+    def _check_group_cardinality(self, group: "Group", hits: Set) -> None:
+        """Enforce the minimum/maximum number of present keys of a group."""
+        count = len(hits)
+        if (group.min_count is not None and count < group.min_count) or (
+            group.max_count is not None and count > group.max_count
+        ):
+            s_keys = ", ".join(repr(k) for k in sorted(hits, key=repr))
+            message = (
+                "Group %r requires between %s and %s present key(s), "
+                "found %d present key(s): %s"
+                % (
+                    group.name,
+                    "0" if group.min_count is None else group.min_count,
+                    "any" if group.max_count is None else group.max_count,
+                    count,
+                    s_keys,
+                )
+            )
+            message = self._prepend_schema_name(message)
+            raise SchemaGroupError(message)
 
     def is_valid(self, data: Any, **kwargs: Dict[str, Any]) -> bool:
         """Return whether the given data has passed all the validations
@@ -462,7 +575,22 @@ class Schema(object):
             # Custom errors from key schemas that rejected a data key, kept so
             # they can be surfaced if that key ends up being a wrong key.
             key_errors: Dict = {}
+            # Field groups declared in this dict, and the raw input keys each
+            # group matched. Matching is based solely on the raw input keys,
+            # independently from value validation, so a bad value is never
+            # reported as a missing group member.
+            groups = {
+                skey.group
+                for skey in sorted_skeys
+                if isinstance(skey, GroupMember)
+            }
+            raw_group_hits: Dict[Group, Set] = {group: set() for group in groups}
+            group_members = [skey for skey in sorted_skeys if isinstance(skey, GroupMember)]
             with exitstack:
+                for raw_key in data:
+                    for member in group_members:
+                        if self._member_key_matches(member, raw_key, e, kwargs):
+                            raw_group_hits[member.group].add(raw_key)
                 # Evaluate dictionaries last
                 data_items = sorted(
                     data.items(), key=lambda value: isinstance(value[1], dict)
@@ -546,16 +674,38 @@ class Schema(object):
                 raise SchemaWrongKeyError(message, errors)
 
             # Apply default-having optionals that haven't been used:
-            defaults = (
-                set(k for k in s if isinstance(k, Optional) and hasattr(k, "default"))
-                - coverage
-            )
+            defaults = set(
+                k
+                for k in s
+                if isinstance(self._optional_marker(k), Optional)
+                and hasattr(self._optional_marker(k), "default")
+            ) - coverage
+            filled_defaults: List = []
             for default in defaults:
-                new[default.key] = (
-                    _invoke_with_optional_kwargs(default.default, **kwargs)
-                    if callable(default.default)
-                    else default.default
+                optional = self._optional_marker(default)
+                filled_defaults.append(optional)
+                new[optional.key] = (
+                    _invoke_with_optional_kwargs(optional.default, **kwargs)
+                    if callable(optional.default)
+                    else optional.default
                 )
+
+            for group in groups:
+                hits = raw_group_hits[group]
+                if group.count == COUNT_FILLED:
+                    hits = set(hits)
+                    for member in s:
+                        optional = self._optional_marker(member)
+                        if (
+                            isinstance(member, GroupMember)
+                            and member.group is group
+                            and isinstance(optional, Optional)
+                            and hasattr(optional, "default")
+                            and optional in filled_defaults
+                            and optional.key not in hits
+                        ):
+                            hits.add(optional.key)
+                self._check_group_cardinality(group, hits)
 
             return new
         if flavor == TYPE:
@@ -787,20 +937,31 @@ class Schema(object):
                     expanded_schema = {}
                     additional_properties = i
                     for key in s:
-                        if isinstance(key, Hook):
+                        plain_key = key
+                        while isinstance(plain_key, GroupMember):
+                            plain_key = plain_key.schema
+                        if isinstance(plain_key, Required):
+                            plain_key = plain_key.schema
+                        if isinstance(plain_key, Hook):
                             continue
 
                         def _key_allows_additional_properties(key: Any) -> bool:
                             """Check if a key is broad enough to allow additional properties"""
-                            if isinstance(key, Optional):
-                                return _key_allows_additional_properties(key.schema)
+                            plain = key
+                            while isinstance(plain, GroupMember):
+                                plain = plain.schema
+                            if isinstance(plain, (Optional, Required)):
+                                return _key_allows_additional_properties(plain.schema)
 
                             return key == str or key == object
 
                         def _get_key_title(key: Any) -> Union[str, None]:
                             """Get the title associated to a key (as specified in a Literal object). Return None if not a Literal"""
-                            if isinstance(key, Optional):
-                                return _get_key_title(key.schema)
+                            plain = key
+                            while isinstance(plain, GroupMember):
+                                plain = plain.schema
+                            if isinstance(plain, (Optional, Required)):
+                                return _get_key_title(plain.schema)
 
                             if isinstance(key, Literal):
                                 return key.title
@@ -809,8 +970,11 @@ class Schema(object):
 
                         def _get_key_description(key: Any) -> Union[str, None]:
                             """Get the description associated to a key (as specified in a Literal object). Return None if not a Literal"""
-                            if isinstance(key, Optional):
-                                return _get_key_description(key.schema)
+                            plain = key
+                            while isinstance(plain, GroupMember):
+                                plain = plain.schema
+                            if isinstance(plain, (Optional, Required)):
+                                return _get_key_description(plain.schema)
 
                             if isinstance(key, Literal):
                                 return key.description
@@ -819,8 +983,11 @@ class Schema(object):
 
                         def _get_key_name(key: Any) -> Any:
                             """Get the name of a key (as specified in a Literal object). Return the key unchanged if not a Literal"""
-                            if isinstance(key, Optional):
-                                return _get_key_name(key.schema)
+                            plain = key
+                            while isinstance(plain, GroupMember):
+                                plain = plain.schema
+                            if isinstance(plain, (Optional, Required)):
+                                return _get_key_name(plain.schema)
 
                             if isinstance(key, Literal):
                                 return key.schema
@@ -835,7 +1002,7 @@ class Schema(object):
                         key_name = _get_key_name(key)
 
                         if isinstance(key_name, str):
-                            if not isinstance(key, Optional):
+                            if not isinstance(plain_key, Optional):
                                 required_keys.append(key_name)
                             expanded_schema[key_name] = _json_schema(
                                 sub_schema,
@@ -843,11 +1010,15 @@ class Schema(object):
                                 title=_get_key_title(key),
                                 description=_get_key_description(key),
                             )
-                            if isinstance(key, Optional) and hasattr(key, "default"):
+                            if isinstance(plain_key, Optional) and hasattr(
+                                plain_key, "default"
+                            ):
                                 expanded_schema[key_name]["default"] = _to_json_type(
-                                    _invoke_with_optional_kwargs(key.default, **kwargs)
-                                    if callable(key.default)
-                                    else key.default
+                                    _invoke_with_optional_kwargs(
+                                        plain_key.default, **kwargs
+                                    )
+                                    if callable(plain_key.default)
+                                    else plain_key.default
                                 )
                         elif isinstance(key_name, Or):
                             # JSON schema does not support having a key named one name or another, so we just add both options
@@ -889,6 +1060,19 @@ class Schema(object):
         return _json_schema(self, True)
 
 
+class Required(Schema):
+    """Marker for a required part of the validation Schema.
+
+    Unmarked dict keys are required as well; this marker makes the
+    requirement explicit and lets a required key take part in a field
+    group.
+    """
+
+    def reset(self) -> None:
+        if hasattr(self._schema, "reset"):
+            self._schema.reset()
+
+
 class Optional(Schema):
     """Marker for an optional part of the validation Schema."""
 
@@ -921,6 +1105,112 @@ class Optional(Schema):
     def reset(self) -> None:
         if hasattr(self._schema, "reset"):
             self._schema.reset()
+
+
+class Group:
+    """A named group of dict keys with min/max cardinality constraints.
+
+    Call the group with a key schema (``group("key")``) to mark a dict key
+    as a member. A single input key can be matched by several overlapping
+    groups and is counted in each of them; within one group it is counted
+    only once even if several member patterns match it.
+
+    ``count`` selects how presence is measured: ``COUNT_RAW`` (the default)
+    counts only keys present in the original input, while ``COUNT_FILLED``
+    also counts optional members that were filled in with their default.
+    """
+
+    def __init__(
+        self,
+        name: Union[str, None] = None,
+        min_count: Union[int, None] = None,
+        max_count: Union[int, None] = None,
+        count: str = COUNT_RAW,
+    ) -> None:
+        if name is not None and not isinstance(name, str):
+            raise TypeError("Group name must be a string or None, not %r" % (name,))
+        for value, label in ((min_count, "min_count"), (max_count, "max_count")):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValueError(
+                    "%s must be a non-negative integer or None, not %r"
+                    % (label, value)
+                )
+        if (
+            min_count is not None
+            and max_count is not None
+            and min_count > max_count
+        ):
+            raise ValueError(
+                "min_count (%d) cannot be greater than max_count (%d)"
+                % (min_count, max_count)
+            )
+        if count not in (COUNT_RAW, COUNT_FILLED):
+            raise ValueError(
+                "count must be COUNT_RAW or COUNT_FILLED, not %r" % (count,)
+            )
+        self._name: Union[str, None] = name
+        self._min_count: Union[int, None] = min_count
+        self._max_count: Union[int, None] = max_count
+        self._count: str = count
+
+    @property
+    def name(self) -> Union[str, None]:
+        """The group name shown in error messages."""
+        return self._name
+
+    @property
+    def min_count(self) -> Union[int, None]:
+        """Minimum number of present member keys."""
+        return self._min_count
+
+    @property
+    def max_count(self) -> Union[int, None]:
+        """Maximum number of present member keys."""
+        return self._max_count
+
+    @property
+    def count(self) -> str:
+        """Presence counting mode (COUNT_RAW or COUNT_FILLED)."""
+        return self._count
+
+    def __repr__(self) -> str:
+        params = []
+        if self._name is not None:
+            params.append(repr(self._name))
+        if self._min_count is not None:
+            params.append("min_count=%d" % self._min_count)
+        if self._max_count is not None:
+            params.append("max_count=%d" % self._max_count)
+        params.append("count=%r" % self._count)
+        return "Group(%s)" % ", ".join(params)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> "GroupMember":
+        """Return a dict key marker adding the given key schema to the group."""
+        return GroupMember(self, *args, **kwargs)
+
+
+class GroupMember(Schema):
+    """Dict key marker marking a key schema as member of a field Group."""
+
+    def __init__(self, group: Group, *args: Any, **kwargs: Any) -> None:
+        self.group: Group = group
+        super(GroupMember, self).__init__(*args, **kwargs)
+
+    @property
+    def schema(self) -> Any:
+        """The wrapped key schema."""
+        return self._schema
+
+    def reset(self) -> None:
+        if hasattr(self._schema, "reset"):
+            self._schema.reset()
+
+    def __repr__(self) -> str:
+        return "GroupMember(%r, %r)" % (self.group, self._schema)
 
 
 class Hook(Schema):
