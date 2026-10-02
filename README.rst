@@ -309,6 +309,44 @@ default can also be a callable:
     >>> Schema({Optional('data', default=dict): {}}).validate({}) == {'data': {}}
     True
 
+Use ``FieldGroup`` to constrain how many keys from a group may occur. Group
+keys can be literals, ``Required``/``Optional`` markers, regular expressions,
+and any other key validators:
+
+.. code:: python
+
+    >>> from schema import FieldGroup, Optional, Required, Schema
+    >>> config_schema = Schema({
+    ...     Required("username"): str,
+    ...     Optional("password"): str,
+    ...     Optional("token"): str,
+    ...     Optional("proxy"): str,
+    ...     Optional("proxy_url"): str,
+    ... }, groups=[
+    ...     FieldGroup(
+    ...         "credentials",
+    ...         ("username", "password", "token"),
+    ...         min_occurrences=2,
+    ...     ),
+    ...     FieldGroup(
+    ...         "proxy",
+    ...         ("proxy", "proxy_url"),
+    ...         max_occurrences=1,
+    ...     ),
+    ... ])
+    >>> config_schema.validate({
+    ...     "username": "Sam",
+    ...     "password": "secret",
+    ...     "proxy_url": "http://proxy.example",
+    ... })
+    {'username': 'Sam', 'password': 'secret', 'proxy_url': 'http://proxy.example'}
+
+By default, occurrences are counted in the original input
+(``count="input"``). Use ``count="complete"`` to count keys in the completed
+result after optional defaults have been added. A key that matches more than
+one pattern in the same group is counted once; a key that belongs to multiple
+groups is counted separately for each group.
+
 Also, a caveat: If you specify types, **schema** won't validate the empty dict:
 
 .. code:: python

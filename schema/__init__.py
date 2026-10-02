@@ -2,6 +2,7 @@
 obtained from config-files, forms, external services or command-line
 parsing, converted from JSON/YAML (or something else) to Python data-types."""
 
+import copy
 import inspect
 import re
 from typing import (
@@ -44,8 +45,11 @@ __all__ = [
     "Use",
     "Forbidden",
     "Const",
+    "FieldGroup",
     "Literal",
+    "Required",
     "SchemaError",
+    "SchemaGroupError",
     "SchemaWrongKeyError",
     "SchemaMissingKeyError",
     "SchemaForbiddenKeyError",
@@ -104,6 +108,41 @@ class SchemaOnlyOneAllowedError(SchemaError):
     """Error should be raised when an only_one Or key has multiple matching candidates"""
 
     pass
+
+
+class SchemaGroupError(SchemaError):
+    """Error raised when a field group occurrence constraint is violated."""
+
+    def __init__(
+        self,
+        group_name: str,
+        matched_keys: List[Any],
+        min_occurrences: int,
+        max_occurrences: Union[int, None],
+        occurrence_count: int,
+        schema_name: Union[str, None] = None,
+    ) -> None:
+        self.group_name = group_name
+        self.matched_keys = matched_keys
+        self.min_occurrences = min_occurrences
+        self.max_occurrences = max_occurrences
+        self.occurrence_count = occurrence_count
+
+        if occurrence_count < min_occurrences:
+            constraint = f"requires at least {min_occurrences}"
+        else:
+            constraint = f"allows at most {max_occurrences}"
+
+        rendered_keys = (
+            ", ".join(repr(key) for key in matched_keys) if matched_keys else "(none)"
+        )
+        message = (
+            f"Field group {group_name!r} {constraint} key(s), "
+            f"found {occurrence_count}: {rendered_keys}"
+        )
+        if schema_name:
+            message = f"{schema_name!r} {message}"
+        super().__init__(message)
 
 
 class SchemaForbiddenKeyError(SchemaError):
@@ -328,6 +367,78 @@ class Use:
             )
 
 
+class FieldGroup:
+    """Occurrence constraints for a group of dictionary keys."""
+
+    INPUT = "input"
+    COMPLETE = "complete"
+
+    def __init__(
+        self,
+        name: str,
+        keys: Iterable[Any],
+        min_occurrences: int = 0,
+        max_occurrences: Union[int, None] = None,
+        count: str = INPUT,
+    ) -> None:
+        if not isinstance(name, str) or not name:
+            raise ValueError("Field group name must be a non-empty string")
+        if isinstance(keys, (str, bytes)):
+            raise TypeError("Field group keys must be a non-string iterable")
+        try:
+            self._keys: Tuple[Any, ...] = tuple(keys)
+        except TypeError:
+            raise TypeError("Field group keys must be iterable")
+        if not self._keys:
+            raise ValueError("Field group must contain at least one key")
+        if not isinstance(min_occurrences, int) or isinstance(min_occurrences, bool):
+            raise TypeError("min_occurrences must be an integer")
+        if min_occurrences < 0:
+            raise ValueError("min_occurrences cannot be negative")
+        if max_occurrences is not None and (
+            not isinstance(max_occurrences, int) or isinstance(max_occurrences, bool)
+        ):
+            raise TypeError("max_occurrences must be an integer or None")
+        if max_occurrences is not None and max_occurrences < 0:
+            raise ValueError("max_occurrences cannot be negative")
+        if max_occurrences is not None and max_occurrences < min_occurrences:
+            raise ValueError("max_occurrences cannot be less than min_occurrences")
+        if count not in (self.INPUT, self.COMPLETE):
+            raise ValueError("count must be either 'input' or 'complete'")
+
+        self._name = name
+        self._min_occurrences = min_occurrences
+        self._max_occurrences = max_occurrences
+        self._count = count
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}({self._name!r}, {self._keys!r}, "
+            f"min_occurrences={self._min_occurrences!r}, "
+            f"max_occurrences={self._max_occurrences!r}, count={self._count!r})"
+        )
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def keys(self) -> Tuple[Any, ...]:
+        return self._keys
+
+    @property
+    def min_occurrences(self) -> int:
+        return self._min_occurrences
+
+    @property
+    def max_occurrences(self) -> Union[int, None]:
+        return self._max_occurrences
+
+    @property
+    def count(self) -> str:
+        return self._count
+
+
 COMPARABLE, CALLABLE, VALIDATOR, TYPE, DICT, ITERABLE = range(6)
 
 
@@ -347,6 +458,24 @@ def _priority(s: Any) -> int:
         return CALLABLE
     else:
         return COMPARABLE
+
+
+def _copy_key_matcher(key: Any) -> Any:
+    """Copy a stateful key matcher without mutating the declared schema."""
+    try:
+        return copy.deepcopy(key)
+    except TypeError:
+        try:
+            return copy.copy(key)
+        except TypeError:
+            return key
+
+
+def _group_key_matcher(key: Any) -> Any:
+    """Return the key matcher represented by a Required/Optional marker."""
+    if isinstance(key, (Required, Optional)):
+        return key.schema
+    return key
 
 
 def _invoke_with_optional_kwargs(f: Callable[..., Any], **kwargs: Any) -> Any:
@@ -370,6 +499,7 @@ class Schema(object):
         name: Union[str, None] = None,
         description: Union[str, None] = None,
         as_reference: bool = False,
+        groups: Union[Iterable[FieldGroup], None] = None,
     ) -> None:
         self._schema: Any = schema
         self._error: Union[str, None] = error
@@ -377,6 +507,9 @@ class Schema(object):
         self._name: Union[str, None] = name
         self._description: Union[str, None] = description
         self.as_reference: bool = as_reference
+        self._groups: Tuple[FieldGroup, ...] = tuple(groups or ())
+        if not all(isinstance(group, FieldGroup) for group in self._groups):
+            raise TypeError("groups must contain FieldGroup instances")
 
         if as_reference and name is None:
             raise ValueError("Schema used as reference should have a name")
@@ -400,11 +533,17 @@ class Schema(object):
     def ignore_extra_keys(self) -> bool:
         return self._ignore_extra_keys
 
+    @property
+    def groups(self) -> Tuple[FieldGroup, ...]:
+        return self._groups
+
     @staticmethod
     def _dict_key_priority(s) -> float:
         """Return priority for a given key object."""
         if isinstance(s, Hook):
             return _priority(s._schema) - 0.5
+        if isinstance(s, Required):
+            return _priority(s._schema) - 0.25
         if isinstance(s, Optional):
             return _priority(s._schema) + 0.5
         return _priority(s)
@@ -433,6 +572,56 @@ class Schema(object):
         if self._name:
             message = "{0!r} {1!s}".format(self._name, message)
         return message
+
+    @staticmethod
+    def _required_key_name(key: Any) -> Any:
+        if isinstance(key, Required):
+            key = key.schema
+        if isinstance(key, Literal):
+            return key.schema
+        return key
+
+    def _validate_field_groups(
+        self, input_data: Dict, completed_data: Dict, **kwargs: Any
+    ) -> None:
+        """Validate field group occurrence counts."""
+        for group in self._groups:
+            source_data = (
+                completed_data if group.count == FieldGroup.COMPLETE else input_data
+            )
+            source_keys = sorted(source_data.keys(), key=repr)
+            group_matchers = [
+                _copy_key_matcher(_group_key_matcher(matcher))
+                for matcher in group.keys
+            ]
+            matched_keys = []
+            for key in source_keys:
+                for matcher in group_matchers:
+                    try:
+                        self.__class__(matcher, error=self._error).validate(
+                            key, **kwargs
+                        )
+                    except SchemaError:
+                        continue
+                    matched_keys.append(key)
+                    break
+
+            count = len(matched_keys)
+            for matcher in group_matchers:
+                if hasattr(matcher, "reset"):
+                    matcher.reset()
+            if count < group.min_occurrences or (
+                group.max_occurrences is not None and count > group.max_occurrences
+            ):
+                error = SchemaGroupError(
+                    group.name,
+                    matched_keys,
+                    group.min_occurrences,
+                    group.max_occurrences,
+                    count,
+                    self._name,
+                )
+                raise error
 
     def validate(self, data: Any, **kwargs: Dict[str, Any]) -> Any:
         Schema = self.__class__
@@ -513,8 +702,11 @@ class Schema(object):
             required = set(k for k in s if not self._is_optional_type(k))
             if not required.issubset(coverage):
                 missing_keys = required - coverage
+                missing_key_names = [
+                    self._required_key_name(k) for k in missing_keys
+                ]
                 s_missing_keys = ", ".join(
-                    repr(k) for k in sorted(missing_keys, key=repr)
+                    repr(k) for k in sorted(missing_key_names, key=repr)
                 )
                 message = "Missing key%s: %s" % (
                     _plural_s(missing_keys),
@@ -557,6 +749,7 @@ class Schema(object):
                     else default.default
                 )
 
+            self._validate_field_groups(data, new, **kwargs)
             return new
         if flavor == TYPE:
             if isinstance(data, s) and not (isinstance(data, bool) and s == int):
@@ -799,7 +992,7 @@ class Schema(object):
 
                         def _get_key_title(key: Any) -> Union[str, None]:
                             """Get the title associated to a key (as specified in a Literal object). Return None if not a Literal"""
-                            if isinstance(key, Optional):
+                            if isinstance(key, (Required, Optional)):
                                 return _get_key_title(key.schema)
 
                             if isinstance(key, Literal):
@@ -809,7 +1002,7 @@ class Schema(object):
 
                         def _get_key_description(key: Any) -> Union[str, None]:
                             """Get the description associated to a key (as specified in a Literal object). Return None if not a Literal"""
-                            if isinstance(key, Optional):
+                            if isinstance(key, (Required, Optional)):
                                 return _get_key_description(key.schema)
 
                             if isinstance(key, Literal):
@@ -819,7 +1012,7 @@ class Schema(object):
 
                         def _get_key_name(key: Any) -> Any:
                             """Get the name of a key (as specified in a Literal object). Return the key unchanged if not a Literal"""
-                            if isinstance(key, Optional):
+                            if isinstance(key, (Required, Optional)):
                                 return _get_key_name(key.schema)
 
                             if isinstance(key, Literal):
@@ -887,6 +1080,20 @@ class Schema(object):
             return _create_or_use_ref(return_schema)
 
         return _json_schema(self, True)
+
+
+class Required(Schema):
+    """Marker for a required part of the validation Schema."""
+
+    def __hash__(self) -> int:
+        return hash(self._schema)
+
+    def __eq__(self, other: Any) -> bool:
+        return self.__class__ is other.__class__ and self._schema == other._schema
+
+    def reset(self) -> None:
+        if hasattr(self._schema, "reset"):
+            self._schema.reset()
 
 
 class Optional(Schema):

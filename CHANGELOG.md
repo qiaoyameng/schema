@@ -3,6 +3,9 @@
 
 ## Unreleased
 
+### Features
+
+* Add `FieldGroup` dictionary key occurrence constraints and explicit `Required` key markers.
 
 ## v0.7.8 (2025-10-11)
 
@@ -160,5 +163,3 @@
 ### Features
 
 * Add the "Regex" class. [Stavros Korokithakis]
-
-

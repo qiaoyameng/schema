@@ -19,15 +19,18 @@ from pytest import mark, raises
 from schema import (
     And,
     Const,
+    FieldGroup,
     Forbidden,
     Hook,
     Literal,
     Optional,
     Or,
     Regex,
+    Required,
     Schema,
     SchemaError,
     SchemaForbiddenKeyError,
+    SchemaGroupError,
     SchemaMissingKeyError,
     SchemaUnexpectedTypeError,
     SchemaWrongKeyError,
@@ -417,6 +420,204 @@ def test_dict_optional_defaults():
 
     with raises(TypeError):
         Optional(And(str, Use(int)), default=7)
+
+
+def test_field_groups_min_max_and_required():
+    config_schema = Schema(
+        {
+            Required("username"): str,
+            Optional("password"): str,
+            Optional("token"): str,
+            Optional(Regex(r"^proxy(?:_url)?$")): str,
+        },
+        groups=[
+            FieldGroup(
+                "credentials",
+                ("username", "password", "token"),
+                min_occurrences=2,
+            ),
+            FieldGroup(
+                "proxy",
+                (Regex(r"^proxy"), Or("proxy", "proxy_url")),
+                max_occurrences=1,
+            ),
+        ],
+    )
+
+    data = {
+        "username": "alice",
+        "password": "secret",
+        "proxy_url": "http://proxy.example",
+    }
+    assert config_schema.validate(data) == data
+
+    with raises(SchemaMissingKeyError, match="Missing key: 'username'"):
+        config_schema.validate({"password": "secret", "token": "token"})
+
+    with raises(SchemaGroupError) as exc_info:
+        config_schema.validate({"username": "alice", "proxy": "http://one"})
+    error = exc_info.value
+    assert error.group_name == "credentials"
+    assert error.matched_keys == ["username"]
+    assert error.occurrence_count == 1
+    assert error.code == (
+        "Field group 'credentials' requires at least 2 key(s), "
+        "found 1: 'username'"
+    )
+    assert "secret" not in error.code
+
+    with raises(SchemaGroupError) as exc_info:
+        config_schema.validate(
+            {
+                "username": "alice",
+                "password": "secret",
+                "proxy": "http://one",
+                "proxy_url": "http://two",
+            }
+        )
+    error = exc_info.value
+    assert error.group_name == "proxy"
+    assert error.matched_keys == ["proxy", "proxy_url"]
+    assert error.occurrence_count == 2
+    assert error.code == (
+        "Field group 'proxy' allows at most 1 key(s), found 2: "
+        "'proxy', 'proxy_url'"
+    )
+
+
+def test_field_groups_match_each_input_key_once_across_patterns():
+    proxy_schema = Schema(
+        {Regex(r"^proxy"): str},
+        groups=[
+            FieldGroup(
+                "proxy",
+                (Regex(r"^proxy"), Or("proxy", "proxy_url")),
+                min_occurrences=1,
+                max_occurrences=1,
+            )
+        ],
+    )
+
+    assert proxy_schema.validate({"proxy": "http://proxy.example"}) == {
+        "proxy": "http://proxy.example"
+    }
+
+    only_one = Or("proxy", "proxy_url", only_one=True)
+    only_one_schema = Schema(
+        {Optional(copy.deepcopy(only_one)): str},
+        groups=[FieldGroup("proxy", (only_one,), min_occurrences=1, max_occurrences=1)],
+    )
+    assert only_one_schema.validate({"proxy": "http://proxy.example"}) == {
+        "proxy": "http://proxy.example"
+    }
+    with raises(SchemaError):
+        only_one_schema.validate(
+            {"proxy": "http://one", "proxy_url": "http://two"}
+        )
+    assert only_one_schema.validate({"proxy_url": "http://proxy.example"}) == {
+        "proxy_url": "http://proxy.example"
+    }
+
+
+def test_field_groups_overlap_and_dict_iteration_order():
+    def uppercase_key(key):
+        return isinstance(key, str) and key.isupper()
+
+    overlapping_groups = [
+        FieldGroup(
+            "authentication",
+            (Regex(r"^(user|token)"), "password"),
+            min_occurrences=1,
+            max_occurrences=3,
+        ),
+        FieldGroup(
+            "credentials",
+            (Regex(r"token$"), "password", "user", uppercase_key),
+            min_occurrences=2,
+            max_occurrences=3,
+        ),
+    ]
+    group_schema = Schema({str: str}, groups=overlapping_groups)
+
+    first_order = {"user": "alice", "TOKEN": "value", "password": "secret"}
+    second_order = dict(reversed(list(first_order.items())))
+
+    assert group_schema.validate(first_order) == first_order
+    assert group_schema.validate(second_order) == second_order
+
+
+def test_field_groups_can_count_input_or_completed_keys():
+    completed_schema = Schema(
+        {
+            Optional("a", default=1): int,
+            Optional("b"): int,
+        },
+        groups=[
+            FieldGroup(
+                "defaults",
+                ("a", "b"),
+                min_occurrences=2,
+                count="complete",
+            )
+        ],
+    )
+    assert completed_schema.validate({"b": 2}) == {"b": 2, "a": 1}
+
+    max_with_default = Schema(
+        {Optional("a", default=1): int, Optional("b"): int},
+        groups=[
+            FieldGroup(
+                "defaults",
+                (Required("a"), Optional("b")),
+                max_occurrences=2,
+                count="complete",
+            )
+        ],
+    )
+    assert max_with_default.validate({"b": 2}) == {"b": 2, "a": 1}
+
+    raw_schema = Schema(
+        {
+            Optional("a", default=1): int,
+            Optional("b"): int,
+        },
+        groups=[
+            FieldGroup(
+                "raw",
+                ("a", "b"),
+                min_occurrences=2,
+                count="input",
+            )
+        ],
+    )
+    with raises(SchemaGroupError) as exc_info:
+        raw_schema.validate({"b": 2})
+    assert exc_info.value.matched_keys == ["b"]
+    assert exc_info.value.occurrence_count == 1
+
+
+def test_field_group_value_error_is_not_reported_as_missing_group_key():
+    group_schema = Schema(
+        {
+            Optional("username"): str,
+            Optional("token"): str,
+        },
+        groups=[FieldGroup("credentials", ("username", "token"), min_occurrences=2)],
+    )
+
+    with raises(SchemaError) as exc_info:
+        group_schema.validate({"username": 1, "token": "value"})
+    assert not isinstance(exc_info.value, SchemaGroupError)
+    assert "Key 'username' error" in exc_info.value.code
+
+
+def test_field_group_invalid_definition():
+    with raises(ValueError, match="min_occurrences cannot be negative"):
+        FieldGroup("group", ("a",), min_occurrences=-1)
+    with raises(ValueError, match="max_occurrences cannot be less than min"):
+        FieldGroup("group", ("a",), min_occurrences=2, max_occurrences=1)
+    with raises(ValueError, match="count must be either 'input' or 'complete'"):
+        FieldGroup("group", ("a",), count="validated")
 
 
 def test_dict_subtypes():
@@ -1019,6 +1220,21 @@ def test_json_schema_optional_key():
         "additionalProperties": False,
         "type": "object",
     }
+
+
+def test_json_schema_required_key():
+    assert Schema({Required("test"): str}).json_schema("my-id")["required"] == [
+        "test"
+    ]
+
+
+def test_required_literal_missing_key_message():
+    try:
+        Schema({Required(Literal("test")): str}).validate({})
+    except SchemaMissingKeyError as error:
+        assert str(error) == "Missing key: 'test'"
+    else:
+        raise AssertionError("Missing key error not raised")
 
 
 def test_json_schema_optional_key_nested():
